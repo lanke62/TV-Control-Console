@@ -1,0 +1,81 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.lanke.nastools'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.lanke.nastools"
+        minSdk 29          // Android 10
+        targetSdk 34
+        versionCode 10
+        versionName "1.3.2"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file("../keystore/nastools.jks")
+            storePassword "nastools"
+            keyAlias "nastools"
+            keyPassword "nastools"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    packaging {
+        resources {
+            excludes += '/META-INF/DEPENDENCIES'
+            excludes += '/META-INF/LICENSE'
+            excludes += '/META-INF/LICENSE.txt'
+            excludes += '/META-INF/NOTICE'
+            excludes += '/META-INF/NOTICE.txt'
+            excludes += '/META-INF/versions/**'
+            excludes += '/META-INF/OSGI-INF/**'
+            excludes += '/META-INF/module-info.class'
+        }
+    }
+}
+
+// SSH 模式下 App 要把 NAS 端脚本传到 NAS 上执行，
+// 直接从源码目录拷进 assets，避免两边版本漂移。
+tasks.register('copyNasScript', Copy) {
+    from rootProject.file('nas/nas_api.py')
+    into file('src/main/assets')
+}
+tasks.named('preBuild') { dependsOn 'copyNasScript' }
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.2.0'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.viewpager2:viewpager2:1.1.0'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+
+    // SSH 客户端：JSch 的活跃 fork，支持 rsa-sha2-256/512 等现代算法
+    implementation 'com.github.mwiede:jsch:0.2.26'
+    // Android 自带的 BouncyCastle 是阉割版，缺 ed25519/curve25519，必须自带完整实现
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.81'
+}

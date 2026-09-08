@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand">#1565C0</color>
+    <color name="brand_dark">#0D47A1</color>
+    <color name="brand_light">#E3F2FD</color>
+
+    <color name="ok">#2E7D32</color>
+    <color name="ok_bg">#E8F5E9</color>
+    <color name="bad">#C62828</color>
+    <color name="bad_bg">#FFEBEE</color>
+    <color name="warn">#EF6C00</color>
+    <color name="warn_bg">#FFF3E0</color>
+    <color name="gray">#616161</color>
+    <color name="gray_bg">#F5F5F5</color>
+
+    <color name="card">#FFFFFF</color>
+    <color name="primary">#1565C0</color>
+
+    <color name="text_primary">#212121</color>
+    <color name="text_secondary">#6B6B6B</color>
+    <color name="divider">#E0E0E0</color>
+    <color name="bg">#F2F4F7</color>
+</resources>

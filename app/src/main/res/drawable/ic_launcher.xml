@@ -1,0 +1,21 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- 盾牌底 -->
+    <path
+        android:fillColor="#1565C0"
+        android:pathData="M24,3 L41,9 V24 C41,34.5 33.5,42 24,45 C14.5,42 7,34.5 7,24 V9 Z" />
+    <!-- 白色表盘 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,14 a10,10 0 1,0 0,20 a10,10 0 1,0 0,-20 z" />
+    <!-- 蓝色指针 -->
+    <path
+        android:fillColor="#1565C0"
+        android:pathData="M22.7,16.4 h2.6 v8.2 h-2.6 z" />
+    <path
+        android:fillColor="#1565C0"
+        android:pathData="M23.7,22.6 h6.9 v2.6 h-6.9 z" />
+</vector>
