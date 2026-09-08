@@ -199,15 +199,32 @@ echo 'HOLIDAY_WINDOWS="18:00-21:00"              # 放假日开放时段' >> /vo
   学段切换（primary/high）移入校历页。
 
 
-## 构建 Release（签名密钥）
+## 构建与签名
 
-签名密钥 `keystore/nastools.jks` **不在仓库里**（见 `.gitignore`）。两种方式：
+仓库里**不含签名密钥，也不含任何口令**（`app/build.gradle` 没有 `signingConfigs`）。
+Gradle 只负责编译，签名在构建后手工完成。
 
-1. **本地构建**：把自己的 `nastools.jks` 放到 `keystore/` 目录，然后
-   ```
-   gradlew.bat assembleRelease
-   ```
-2. **换机构建**：用 Android Studio 重新生成一个 keystore，改 `app/build.gradle` 里的
-   `storeFile / storePassword / keyAlias / keyPassword`。注意签名变了，手机上旧版必须先卸载。
+**1. 编译**（任何人都能跑，密钥缺失不影响）：
 
-> 提醒：密钥丢了不影响开发，只影响「覆盖升级」。换密钥 = 装上新版本要卸载旧版本。
+```bash
+gradlew.bat assembleRelease
+```
+
+产物：`app/build/outputs/apk/release/app-release-unsigned.apk`（未签名，装不上，正常）。
+
+**2. 手工签名**（需要你自己保管的 `keystore/nastools.jks`）：
+
+```bash
+"<Android SDK>/build-tools/34.0.0/apksigner.bat" sign ^
+  --ks keystore/nastools.jks ^
+  --ks-key-alias nastools ^
+  --out TV管控台-v1.3.2.apk ^
+  app/build/outputs/apk/release/app-release-unsigned.apk
+```
+
+回车后依次输入 store 口令和 key 口令（本机都是 `nastools`）。出来的 APK 就能覆盖安装升级了。
+
+也可以用 Android Studio 的 **Build → Generate Signed Bundle / APK**，效果一样。
+
+> 密钥丢了不影响开发和编译，只影响「覆盖升级」。换密钥 = 旧版本必须先卸载。
+> 想让 Gradle 自动签名就自己加回 `signingConfigs`，但别把口令提交上来。

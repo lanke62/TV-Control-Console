@@ -14,20 +14,13 @@ android {
         versionName "1.3.2"
     }
 
-    signingConfigs {
-        release {
-            storeFile file("../keystore/nastools.jks")
-            storePassword "nastools"
-            keyAlias "nastools"
-            keyPassword "nastools"
-        }
-    }
+    // 签名配置不进仓库：源码里不含 jks，也不含任何口令。
+    // 需要可安装的 release 包时，构建后用 apksigner 手工签名，见 README「构建与签名」。
 
     buildTypes {
         release {
             minifyEnabled false
             shrinkResources false
-            signingConfig signingConfigs.release
         }
         debug {
             minifyEnabled false

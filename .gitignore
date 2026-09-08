@@ -19,4 +19,8 @@ nas/__pycache__/
 # 本地 SSH 相关（勿入库）
 id_ed25519*
 known_hosts
+
+# 签名密钥与签名配置（口令不进仓库，见 README「构建与签名」）
 keystore/*.jks
+keystore.properties
+*.apk.idsig
