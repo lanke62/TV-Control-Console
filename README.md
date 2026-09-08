@@ -1,21 +1,30 @@
-# 群晖管控台（NAS Tools）
+# TV管控台（NAS Tools）
 
-把 `projector_block`（投影仪网络管控）和 `school-calendar`（校历 + Media 账号管控）
-两个项目的日常操作，合并进一个安卓 App 里，手机上改完立刻生效。
+把 `projector_block`（电视端网络管控）和 `school-calendar`（校历）两个项目的日常操作，
+合并进一个安卓 App 里，手机上改完立刻生效。
 
+- **源码仓库**：https://github.com/lanke62/TV-Control-Console （public，main 分支）
 - **最低系统**：Android 10（minSdk 29），targetSdk 34。
-- **工作原理**：手机不直接碰 iptables / 密码，而是调用群晖上的一个纯标准库 Python 服务
-  `nas_api.py`；该服务以 root 运行，去跑你现有的那两个脚本。
-- **改完即生效**：配置一改，服务立刻补跑一遍 `media_access.sh` 和 `projector_block.sh`，
-  不用等每小时 / 每 5 分钟的定时任务。
+- **工作原理（v1.2.4 起纯 SSH）**：手机上不装任何常驻服务。App 用 JSch SSH 登录群晖管理员账号，
+  经 `sudo -S` 把 `nas_api.py`（打包在 assets 里，首次经 SFTP 传到 NAS `/tmp/nas_tools/`）
+  以 root 跑起来，靠命令行 `--json` 收发结果。NAS 上不开额外端口、不建任务计划。
+  旧版「NAS 常驻 HTTP 服务 + 令牌」方案已彻底移除。
+- **改完即生效**：配置一改，立刻补跑一遍 `projector_block.sh`，不用等定时任务。
+- **Media 账号密码管控**：v1.2.2 起已从 App 移除（改用电视端内外网开关达成同样目的）。
+
+> 下面第一、二节仍带 v1.0 时期的痕迹，**以 App 实际界面和文末「更新记录」为准**。
 
 ---
 
 ## 一、你要装两样东西
 
+> ⚠️ 这一节是 **v1.0 的 HTTP 常驻服务方案**（建任务计划、改令牌、开 8899 端口），**已废弃**。
+> 现行方案是纯 SSH 直连，见 `SSH直连使用说明.md`：只需在群晖「控制面板 → 终端机和 SNMP」开启 SSH，
+> 然后在 App「设置」页填主机 / 管理员账号 / 密码即可，NAS 端脚本由 App 自己上传。
+
 | 文件 | 装到哪 | 说明 |
 |---|---|---|
-| `群晖管控台-v1.0.apk` | 手机 | Android 10 及以上 |
+| `TV管控台-v1.3.2-代码清理版.apk` | 手机 | Android 10 及以上 |
 | `nas_tools_NAS端_v1.0.tar.gz` | 群晖 `/volume1/docker/` | 内含 `nas_api.py`、`media_access.sh`、`conf/api.conf` |
 
 **部署步骤全部在 `部署手册.md` 里**，一步一步照着做即可（约 15 分钟），
@@ -33,24 +42,25 @@
 
 ---
 
-## 二、App 的五个页签
+## 二、App 的三个页签（v1.2.3 起）
 
 | 页签 | 能干什么 |
 |---|---|
-| **状态** | 今天类型、当前时段、Media 状态、投影仪状态、已拦截包数；「立即应用」「强制封禁/放行」「恢复自动」 |
-| **时段** | 编辑上学日 / 放假日的开放时段（可增删多段），保存即生效 |
-| **开关** | `BLOCK_WAN`、`BLOCK_NAS`、`KICK_*`、`BLOCK_MODE`、学段、儿童节，以及投影仪 IP/MAC/网口等 |
-| **校历** | 月历查看；点某天临时改成上学/放假；重建校历；联网更新国务院节假日；编辑寒暑假区间 |
-| **日志** | 直接看 NAS 上的 4 份日志（校历构建、Media 切换、投影仪、API 服务） |
+| **电视端** | 电视端状态（应置/当前模式、外网群晖、已拦截包数）；长期放行 / 校历模式 / 长期封禁 三选一；开放时段（上学日 / 放假日）；独立功能开关（外网 / 群晖，开=放行）；TV 端参数跳转；「保存并立即生效」 |
+| **校历** | 月历查看（只读）；寒暑假起止日期；学段切换（小学 / 高中）；重建校历；联网更新节假日 |
+| **设置** | SSH 连接配置（主机 / 端口 / 账号 / 密码）；连接状态；NAS 日志查看与复制；排查提示；「SSH 连接诊断」 |
+
+> 改动在页面上是「待保存」的：模式、开关、时段都只在内存里改，点「保存并立即生效」才下发；
+> 下拉刷新会还原成 NAS 上的真实配置。
 
 ### 几个设计上的说明
 
 - **单一数据源**：两个项目共用 `calendar.conf` 里的 `SCHOOL_WINDOWS` / `HOLIDAY_WINDOWS`，
   App 改一处两边同时生效（和现有设计一致）。
-- **强制模式是「粘性」的**：投影仪的 `--on/--off` 原本就写文件；Media 的强制是新加的
-  `data/.media_override`，一直保持到你点「恢复自动」，每小时的定时任务不会顶掉它。
-- **Media 的强制按钮需要第 4 步升级脚本**。不升级也能用，只是那两个按钮是灰的，
-  其余功能不受影响（App 会自动检测并提示）。
+- **强制模式是「粘性」的**：电视端的 `--on/--off` 会写 `data/.projector_override`，
+  一直保持到你点「校历模式」，定时任务不会顶掉它。
+- **Media 相关全部作废**：v1.2.2 起 App 不再读写 `data/.media_override`，也不再改 Media 账号密码，
+  `nas_api.py` 里的 `media_*` 动作已清理。下面的描述仅作历史记录。
 - **改 conf 的方式**：只按 `KEY=` 逐行精确替换，保留注释和文件结构，
   改之前先备份成 `.bak`。写回一律 UTF-8 + LF（顺手把 CRLF 也归一化）。
 - **所有输入都做校验**：时段必须是 `HH:MM-HH:MM` 且结束晚于开始；
@@ -62,16 +72,22 @@
 
 ```
 NAS_Tools_apk/
-├── 群晖管控台-v1.0.apk            <- 手机装这个
-├── nas_tools_NAS端_v1.0.tar.gz    <- 群晖上解压这个
-├── 部署手册.md                     <- 一步一步的部署说明
+├── TV管控台-v1.3.2-代码清理版.apk   <- 手机装这个（历史 APK 未入库）
+├── nas_tools_NAS端_v1.0.tar.gz     <- 群晖上解压这个（未入库）
+├── 部署手册.md                      <- 一步一步的部署说明
 ├── nas/                            <- NAS 端源码（改这里后重新打包）
-│   ├── nas_api.py                  API 服务（只用标准库，兼容 Python 3.8）
-│   ├── media_access.sh             v2，比线上版多了 .media_override 强制支持
-│   └── conf/api.conf               端口 / 令牌
-├── keystore/nastools.jks           自签名（store/alias 口令都是 nastools）
-└── app/                            Android 工程（Java 17 / AGP 8.7.3 / compileSdk 34）
+│   ├── nas_api.py                  命令行 + HTTP 双模式（只用标准库，兼容 Python 3.8）
+│   │                               App 实际走的是 CLI --json，HTTP 分支仅供调试
+│   ├── media_access.sh             遗留文件，App 已不调用
+│   └── conf/api.conf               仅 HTTP 模式用到，SSH 模式不需要
+├── keystore/                       自签名密钥，**不入库**（见「构建与签名」）
+│   └── nastools.jks                store/alias/key 口令都是 nastools
+├── app/                            Android 工程（Java 17 / AGP 8.7.3 / compileSdk 34）
+└── .workbuddy/                     本地工作区数据，未入库
 ```
+
+**未纳入版本管理**：`*.apk`、`*.tar.gz`、`keystore/*.jks`、`local.properties`、
+`keystore.properties`、`.gradle/`、`build/`、`.workbuddy/`。
 
 ## 四、重新构建
 
@@ -81,7 +97,8 @@ set ANDROID_HOME=C:\Users\Lanke62\AppData\Local\Android\Sdk
 gradlew.bat assembleRelease
 ```
 
-产物在 `app/build/outputs/apk/release/app-release.apk`。
+产物是**未签名**的 `app/build/outputs/apk/release/app-release-unsigned.apk`，
+要装到手机上必须先签名，步骤见文末「构建与签名」。
 
 改了 `nas/` 下任何文件后，重新打包：
 
@@ -93,6 +110,9 @@ cd .pkg && tar czf ../nas_tools_NAS端_v1.0.tar.gz nas_tools
 ```
 
 ## 五、接口一览（给将来接别的客户端用）
+
+> 这些是 `nas_api.py` **HTTP 模式**的接口，App 已不再走这条路（改走 CLI `--json`），
+> 保留仅用于手动调试。调用前需先手工把服务跑起来。
 
 全部需要请求头 `X-Token: <令牌>`。
 
@@ -109,9 +129,15 @@ cd .pkg && tar czf ../nas_tools_NAS端_v1.0.tar.gz nas_tools
 
 ## 六、安全提醒
 
-- 服务是**明文 HTTP**，靠令牌保护，只应在局域网使用。
-- **不要把 8899 端口做端口转发 / 映射到公网。**
-- 默认令牌是 `nastools`，部署时请改掉。
+- **SSH 模式（当前唯一模式）**：App 只在局域网内 SSH 登录群晖，NAS 上不开任何新端口。
+  不要把群晖的 SSH 端口（默认 22）做端口转发 / 映射到公网。
+- 群晖有 auto-block：密码连错几次，手机 IP 会被临时封禁。
+- DSM 6+ **禁止 root 直接 SSH 登录**，只能用 administrators 组账号登录再 `sudo -i`，
+  sudo 要的密码就是登录密码。
+- **签名密钥 `keystore/nastools.jks` 绝不要提交到公开仓库**：谁拿到它 + 口令，
+  就能签一个冒名的升级包覆盖你手机上的 App。本仓库已在 `.gitignore` 里排除它。
+- 旧版 HTTP 服务是明文、靠令牌保护，默认令牌 `nastools`。该模式已从 App 移除，
+  若你还在 NAS 上跑着常驻服务，请停掉。
 
 ---
 
@@ -119,6 +145,20 @@ cd .pkg && tar czf ../nas_tools_NAS端_v1.0.tar.gz nas_tools
 
 > 早期 README 停在 v1.0（5 页签 + 含 Media 账号）。v1.2 起结构大改，故这里按日期记关键变更，
 > 不再另写独立交接文档。架构与页面结构的权威描述以 `.workbuddy/memory/MEMORY.md` 为准。
+
+### 2026-09-08（源码托管到 GitHub + 签名配置出库）
+
+- **仓库**：https://github.com/lanke62/TV-Control-Console ，public，main 分支，首个提交 `b735f14`。
+  - **GitHub 不接受中文仓库名**：`TV管控台` 被截成 `TV-`，最终定名 `TV-Control-Console`。
+  - 认证走 `gh auth login --web`（设备码流程），推送走 gh credential helper 的 HTTPS，
+    不需要额外配 SSH key。
+- **不入库的内容**：签名密钥 `keystore/*.jks`、8 个历史 APK + `nas_tools_NAS端_v1.0.tar.gz`、
+  `.workbuddy/`（含内网 IP 的项目笔记）、`local.properties`、`.gradle/`。
+- **签名方案**：`app/build.gradle` 的 `signingConfigs`（内含明文口令 `nastools`）已删除。
+  Gradle 只负责编译，出 `app-release-unsigned.apk`；签名改用 `apksigner` 手工做（见「构建与签名」）。
+  这样任何人 clone 下来都能编译，且仓库里没有任何密钥或口令。
+  - 期间踩过一次坑：SSH 私钥被误建在项目目录并进了 git，因尚未推送，已用
+    `git rm --cached` + `commit --amend` 清除，无泄露。
 
 ### 2026-09-07（v1.3.2：纯代码清理，无行为变更）
 - **已发布** `TV管控台-v1.3.2-代码清理版.apk`（versionCode 10）：
