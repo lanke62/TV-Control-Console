@@ -107,12 +107,15 @@ public class SettingsFragment extends BaseFragment {
                         sb.append("脚本版本：").append(r.json.optString("version", "")).append("\n");
                         sb.append("python3：").append(r.json.optString("python", "")).append("\n");
                         String cal = r.json.optString("cal_home", "");
-                        String proj = r.json.optString("proj_home", "");
+                        String tool = r.json.optString("home", "");
+                        sb.append("工具目录：").append(tool.isEmpty() ? "没找到" : tool).append("\n");
                         sb.append("校历目录：").append(cal.isEmpty() ? "没找到" : cal).append("\n");
-                        sb.append("投影目录：").append(proj.isEmpty() ? "没找到" : proj).append("\n");
-                        if (cal.isEmpty() || proj.isEmpty()) {
-                            sb.append("\n有目录没找到。常见原因是部署位置不在 /volume1，"
-                                    + "或者 conf 文件不在 <项目>/conf/ 下。");
+                        sb.append("iptables：").append(r.json.optString("iptables", "没找到")).append("\n");
+                        sb.append("时区模式：").append(r.json.optBoolean("kerneltz", false)
+                                ? "内核时区（推荐）" : "UTC 换算（兼容模式）").append("\n");
+                        if (cal.isEmpty()) {
+                            sb.append("\n没找到校历目录。校历项目默认在 /volume1/docker/child_calendar，"
+                                    + "不在那儿的话「校历」页和「上学日/放假日」判定都会失效。");
                         }
                         tvResult.setText(sb.toString());
                     } else {
@@ -188,11 +191,11 @@ public class SettingsFragment extends BaseFragment {
 
     private void showLastResult() {
         String cal = Prefs.calHome(requireContext());
-        String proj = Prefs.projHome(requireContext());
-        if (!cal.isEmpty() || !proj.isEmpty()) {
-            tvResult.setText("上次探测结果：\n校历目录："
-                    + (cal.isEmpty() ? "没找到" : cal)
-                    + "\n投影目录：" + (proj.isEmpty() ? "没找到" : proj));
+        String tool = Prefs.toolHome(requireContext());
+        if (!cal.isEmpty() || !tool.isEmpty()) {
+            tvResult.setText("上次探测结果：\n工具目录："
+                    + (tool.isEmpty() ? "没找到" : tool)
+                    + "\n校历目录：" + (cal.isEmpty() ? "没找到" : cal));
         }
     }
 
@@ -218,7 +221,7 @@ public class SettingsFragment extends BaseFragment {
                         String n = names.optString(i);
                         // 兼容旧版 NAS 脚本：不显示 Media 相关日志
                         if (n == null || n.contains("Media") || n.contains("media")) continue;
-                        if ("投影仪".equals(n)) n = "电视端";
+                        if ("电视端".equals(n)) n = "联网控制";
                         JSONArray arr = logs.optJSONArray(n);
                         StringBuilder sb = new StringBuilder();
                         if (arr != null) {

@@ -50,17 +50,27 @@ public class Prefs {
         sp(c).edit().putString("python", p).apply();
     }
 
-    /** 两个项目的目录（自动探测结果），空串表示每次重新探测 */
+    /** 校历项目目录（自动探测结果），空串表示每次重新探测 */
     public static String calHome(Context c) {
         return sp(c).getString("cal_home", "");
     }
 
-    public static String projHome(Context c) {
-        return sp(c).getString("proj_home", "");
+    /** 工具目录（nas_api.py / devices.json 所在），默认 /volume1/docker/nas_tools */
+    public static String toolHome(Context c) {
+        return sp(c).getString("tool_home", "");
     }
 
-    public static void setHomes(Context c, String cal, String proj) {
-        sp(c).edit().putString("cal_home", cal).putString("proj_home", proj).apply();
+    public static void setHomes(Context c, String cal, String tool) {
+        sp(c).edit().putString("cal_home", cal).putString("tool_home", tool).apply();
+    }
+
+    /** 上次在「控制」页选中的设备 id（换设备后重开 App 还停在它上面） */
+    public static String selDev(Context c) {
+        return sp(c).getString("sel_dev", "");
+    }
+
+    public static void setSelDev(Context c, String id) {
+        sp(c).edit().putString("sel_dev", id == null ? "" : id).apply();
     }
 
     /** 已探测到的候选目录，供设置页手动挑选 */

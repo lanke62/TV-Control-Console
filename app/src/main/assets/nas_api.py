@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-nas_api.py —— 「TV管控台」NAS 端 API 服务
+nas_api.py —— 「家庭联网控制」NAS 端执行脚本
 
 用途
-    给安卓手机 APP 提供接口（常驻 HTTP 或命令行均可），用来：
-      * 查看 校历 / 电视端 的实时状态
-      * 修改开放时段（SCHOOL_WINDOWS / HOLIDAY_WINDOWS）
-      * 修改功能开关（BLOCK_WAN / BLOCK_NAS / KICK_* ...）
-      * 重建 / 联网更新校历，编辑寒暑假区间
-      * 立即执行 projector_block.sh（不用等定时任务）
+    给安卓 App 提供命令行接口（App 经 SSH 调用，单行 JSON 收发）：
+      * 查看校历信息 / 设备清单 / 每台设备当前状态
+      * 增删改被控设备（MAC 为身份，不依赖固定 IP）
+      * 每台设备一套开放时段，每个时段独立控制「外网 / 内网」放行
+      * 立即重建防火墙规则（也可由 DSM 任务计划定时调用）
       * 查看日志
 
 设计约束（重要）
     1. 只用 Python 标准库，群晖自带 python3 即可运行，无需 pip 安装任何东西。
     2. 兼容 Python 3.8（群晖 DSM 7.2 自带 python3 3.8.x）。
-    3. 改配置文件时：先备份成 .bak，再按 KEY= 逐行精确替换，
-       绝不整体重写文件（保留注释和结构）。
-    4. 写文件统一用 UTF-8 + LF 换行（Windows 上传的 CRLF 会让 sh 脚本失效）。
-    5. 所有会改系统状态的命令走同一把全局锁，避免并发打架。
+    3. 改配置文件时：先备份成 .bak，再按 KEY= 逐行精确替换，绝不整体重写（保留注释）。
+       设备清单是 JSON，用「写临时文件 + 原子替换」。
+    4. 写文件统一 UTF-8 + LF（Windows 上传的 CRLF 会让 sh 脚本失效）。
+    5. 所有会改系统状态的命令走同一把全局锁。
+    6. 规则一律「全量重建」：先清掉本脚本创建的所有 HNC_* 链，再按设备清单重建。
+       这样删设备不会留残留规则。
 
 部署位置： /volume1/docker/nas_tools/nas_api.py
-配置文件： /volume1/docker/nas_tools/conf/api.conf
-启动方式： nohup /bin/python3 /volume1/docker/nas_tools/nas_api.py >> /volume1/docker/nas_tools/log/api.log 2>&1 &
+配置目录： /volume1/docker/nas_tools/conf/   （devices.json / net.conf）
+日志：     /volume1/docker/nas_tools/log/netctl.log
+校历项目： /volume1/docker/child_calendar    （只读，用来判定今天上学 / 放假）
+
+定时任务（DSM 任务计划，root，开机 + 每 10 分钟）：
+    /bin/python3 /volume1/docker/nas_tools/nas_api.py --apply
 """
 
 import os
@@ -30,50 +35,62 @@ import re
 import sys
 import json
 import time
+import shlex
 import threading
 import subprocess
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # ---------------------------------------------------------------- 路径
 
-SELF_HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SELF_CONF = os.path.join(SELF_HOME, "conf", "api.conf")
-SELF_LOG = os.path.join(SELF_HOME, "log", "api.log")
-
+DEFAULT_HOME = "/volume1/docker/nas_tools"
 DEFAULT_CAL_HOME = "/volume1/docker/child_calendar"
-DEFAULT_PROJ_HOME = "/volume1/docker/projector_block"
 
+HOME = DEFAULT_HOME
 CAL_HOME = DEFAULT_CAL_HOME
-PROJ_HOME = DEFAULT_PROJ_HOME
+
+SELF_CONF_DIR = ""
+SELF_DEVICES = ""
+SELF_NET = ""
+SELF_LOG = ""
+
 CAL_BIN = ""
 CAL_CONF = ""
 CAL_DATA = ""
 CAL_LOG = ""
 CAL_TSV = ""
 CAL_OVERRIDES = ""
-PROJ_BIN = ""
-PROJ_CONF = ""
-PROJ_LOG = ""
+
+CHAIN_PREFIX = "HNC_"
+ICMP_OK = True
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+YM_RE = re.compile(r"^\d{4}-\d{2}$")
+HM_RE = re.compile(r"^\d{2}:\d{2}$")
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+CMD_LOCK = threading.RLock()
 
 
-def set_homes(cal=None, proj=None):
-    """重设两个项目的根目录并刷新所有派生路径。
+def set_homes(home=None, cal=None):
+    """重设工具目录与校历目录，并刷新所有派生路径。
 
     命令行模式下由 App 传入实际路径（不同 NAS 上目录名可能不一样），
     所以这些不能写死成常量。
     """
-    global CAL_HOME, PROJ_HOME
-    global CAL_BIN, CAL_CONF, CAL_DATA, CAL_LOG, CAL_TSV
-    global CAL_OVERRIDES
-    global PROJ_BIN, PROJ_CONF, PROJ_LOG
+    global HOME, CAL_HOME
+    global SELF_CONF_DIR, SELF_DEVICES, SELF_NET, SELF_LOG
+    global CAL_BIN, CAL_CONF, CAL_DATA, CAL_LOG, CAL_TSV, CAL_OVERRIDES
 
+    if home:
+        HOME = home.rstrip("/")
     if cal:
         CAL_HOME = cal.rstrip("/")
-    if proj:
-        PROJ_HOME = proj.rstrip("/")
+
+    SELF_CONF_DIR = os.path.join(HOME, "conf")
+    SELF_DEVICES = os.path.join(SELF_CONF_DIR, "devices.json")
+    SELF_NET = os.path.join(SELF_CONF_DIR, "net.conf")
+    SELF_LOG = os.path.join(HOME, "log", "netctl.log")
 
     CAL_BIN = os.path.join(CAL_HOME, "bin")
     CAL_CONF = os.path.join(CAL_HOME, "conf", "calendar.conf")
@@ -82,22 +99,13 @@ def set_homes(cal=None, proj=None):
     CAL_TSV = os.path.join(CAL_DATA, "school_calendar.txt")
     CAL_OVERRIDES = os.path.join(CAL_HOME, "conf", "overrides.txt")
 
-    PROJ_BIN = os.path.join(PROJ_HOME, "bin")
-    PROJ_CONF = os.path.join(PROJ_HOME, "conf", "projector.conf")
-    PROJ_LOG = os.path.join(PROJ_HOME, "log")
+
+set_homes(DEFAULT_HOME, DEFAULT_CAL_HOME)
 
 
-set_homes(DEFAULT_CAL_HOME, DEFAULT_PROJ_HOME)
-
-
-def detect_homes():
-    """按特征文件自动找两个项目的目录。
-
-    不同人的部署目录名不一样（school-calendar / child_calendar / ...），
-    写死路径迟早对不上，所以直接搜 conf 文件。
-    """
-    found_cal = []
-    found_proj = []
+def detect_cal_home():
+    """按特征文件自动找校历项目目录（不写死目录名）。"""
+    cands = []
     for root in ("/volume1", "/volume2"):
         if not os.path.isdir(root):
             continue
@@ -107,394 +115,352 @@ def detect_homes():
             for ln in out.splitlines():
                 ln = ln.strip()
                 if ln:
-                    found_cal.append(os.path.dirname(os.path.dirname(ln)))
-        rc, out, _e = run(["find", root, "-maxdepth", "5",
-                           "-name", "projector.conf", "-path", "*/conf/*"], timeout=25)
-        if rc == 0:
-            for ln in out.splitlines():
-                ln = ln.strip()
-                if ln:
-                    found_proj.append(os.path.dirname(os.path.dirname(ln)))
-        if found_cal or found_proj:
+                    cands.append(os.path.dirname(os.path.dirname(ln)))
+        if cands:
             break
-
-    # 再补一层浅目录扫描，防止 find 不可用
-    if not found_cal or not found_proj:
-        for root in ("/volume1/docker", "/volume2/docker", "/volume1/homes"):
-            if not os.path.isdir(root):
-                continue
-            try:
-                names = sorted(os.listdir(root))
-            except Exception:
-                continue
-            for n in names:
-                d = os.path.join(root, n)
-                if not os.path.isdir(d):
-                    continue
-                if not found_cal and os.path.isfile(
-                        os.path.join(d, "conf", "calendar.conf")):
-                    found_cal.append(d)
-                if not found_proj and os.path.isfile(
-                        os.path.join(d, "conf", "projector.conf")):
-                    found_proj.append(d)
-
-    cal = found_cal[0] if found_cal else ""
-    proj = found_proj[0] if found_proj else ""
-    return cal, proj, found_cal, found_proj
-
-# ---------------------------------------------------------------- 全局
-
-CFG = {"PORT": "8899", "BIND": "0.0.0.0", "TOKEN": "nastools"}
-CMD_LOCK = threading.Lock()
-
-# 这些键在 conf 里是"裸数字"（不带引号）
-NUM_KEYS = {
-    "BLOCK_WAN", "BLOCK_NAS", "KICK_PROJECTOR_SMB",
-    "KICK_SESSIONS", "CHILDRENS_DAY", "FETCH_TIMEOUT",
-}
-
-WIN_RE = re.compile(r"^\d{2}:\d{2}-\d{2}:\d{2}(;\d{2}:\d{2}-\d{2}:\d{2})*$")
-IP_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
-NET_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
-MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-YM_RE = re.compile(r"^\d{4}-\d{2}$")
+    # 兜底：老路径
+    if not cands and os.path.isdir(DEFAULT_CAL_HOME):
+        cands.append(DEFAULT_CAL_HOME)
+    return (cands[0] if cands else ""), cands
 
 
 # ---------------------------------------------------------------- 基础工具
 
 def dec(b):
-    if b is None:
-        return ""
     if isinstance(b, bytes):
         return b.decode("utf-8", "replace")
-    return b
+    return b or ""
 
 
 def run(cmd, timeout=120, cwd=None):
-    """执行命令，返回 (returncode, stdout, stderr)，永不抛异常"""
+    """跑一条命令，返回 (rc, stdout, stderr)。不抛异常。"""
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=timeout, cwd=cwd)
-        return p.returncode, dec(p.stdout), dec(p.stderr)
-    except subprocess.TimeoutExpired:
-        return 124, "", "命令超时（>%ss）" % timeout
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+            return 124, dec(out), dec(err) + "\n(超时)"
+        return p.returncode, dec(out), dec(err)
     except Exception as e:
-        return 1, "", "执行异常: %s" % e
-
-
-def hm(s):
-    """HH:MM -> 分钟"""
-    try:
-        h, m = s.split(":")
-        return int(h) * 60 + int(m)
-    except Exception:
-        return -1
+        return 127, "", "%s: %s" % (type(e).__name__, e)
 
 
 def tail(path, n):
-    if not os.path.isfile(path):
-        return []
+    out = []
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
+            for line in f:
+                out.append(line.rstrip("\n"))
     except Exception:
         return []
-    return lines[-n:]
+    return out[-max(1, n):]
 
 
 def find_bin(name):
-    for p in ("/sbin/" + name, "/usr/sbin/" + name, "/usr/syno/sbin/" + name):
-        if os.path.exists(p):
+    for p in ("/bin/" + name, "/usr/bin/" + name, "/sbin/" + name, "/usr/sbin/" + name):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
-    return name
-
-
-# ---------------------------------------------------------------- 配置读写
-
-def load_self_conf():
-    cfg = dict(CFG)
-    try:
-        with open(SELF_CONF, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#") or "=" not in s:
-                    continue
-                k, v = s.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                if k.strip():
-                    cfg[k.strip()] = v
-    except Exception:
-        pass
-    if os.environ.get("NAS_API_PORT"):
-        cfg["PORT"] = os.environ["NAS_API_PORT"]
-    if os.environ.get("NAS_API_TOKEN"):
-        cfg["TOKEN"] = os.environ["NAS_API_TOKEN"]
-    return cfg
-
-
-def split_value(rest):
-    """把 KEY= 后面的内容切成 (值, 行尾注释)。
-
-    必须正确处理 `KEY="值"   # 注释` 这种写法 —— 群晖上的 conf 通篇都是这样，
-    早期版本只做 strip + 去首尾引号，结果读出来的值带着引号和一整段注释。
-    """
-    rest = rest.strip()
-    if rest[:1] in ("'", '"'):
-        q = rest[0]
-        buf = []
-        i = 1
-        while i < len(rest):
-            ch = rest[i]
-            if ch == "\\" and i + 1 < len(rest):
-                buf.append(rest[i + 1])
-                i += 2
-                continue
-            if ch == q:
-                break
-            buf.append(ch)
-            i += 1
-        return "".join(buf), rest[i + 1:].strip()
-    idx = rest.find("#")
-    if idx < 0:
-        return rest.strip(), ""
-    return rest[:idx].strip(), rest[idx:].strip()
-
-
-def read_conf(path):
-    """把 sh 风格的 KEY=VALUE 配置读成 dict"""
-    d = {}
-    if not os.path.isfile(path):
-        return d
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", s)
-            if not m:
-                continue
-            v, _comment = split_value(m.group(2))
-            d[m.group(1)] = v
-    return d
-
-
-def trailing_comment(rest):
-    """取出值后面跟着的 # 注释（不在引号内的才算）"""
-    q = None
-    for i, ch in enumerate(rest):
-        if q:
-            if ch == q:
-                q = None
-        elif ch in ("'", '"'):
-            q = ch
-        elif ch == "#":
-            return rest[i:]
+    rc, out, _e = run(["command", "-v", name])
+    if rc == 0 and out.strip():
+        return out.strip().splitlines()[0]
     return ""
 
 
 def valid_hm(s):
-    if not re.fullmatch(r"\d{2}:\d{2}", s):
+    if not HM_RE.match(s or ""):
         return False
-    h = int(s[:2])
-    m = int(s[3:])
-    if m > 59 or h > 24:
-        return False
-    return not (h == 24 and m != 0)       # 允许结束时间写 24:00
+    h, m = int(s[:2]), int(s[3:])
+    return 0 <= h <= 23 and 0 <= m <= 59
 
 
-def validate_kv(key, val):
-    v = "" if val is None else str(val)
-    if key in ("SCHOOL_WINDOWS", "HOLIDAY_WINDOWS"):
-        v = v.strip()
-        if v == "":
-            return ""                      # 空 = 当天永不开放
-        if not WIN_RE.match(v):
-            raise ValueError("时段格式应为 HH:MM-HH:MM，多段用英文分号隔开")
-        for seg in v.split(";"):
-            a, b = seg.split("-")
-            if not valid_hm(a) or not valid_hm(b):
-                raise ValueError("时段 %s 不合法（小时 00-24，分钟 00-59，结束可用 24:00）" % seg)
-            if hm(a) >= hm(b):
-                raise ValueError("时段 %s 的结束时间必须晚于开始时间" % seg)
-        return v
-    if key == "BLOCK_MODE":
-        v = v.strip()
-        if v not in ("reject", "drop"):
-            raise ValueError("BLOCK_MODE 只能是 reject 或 drop")
-        return v
-    if key == "STAGE":
-        v = v.strip()
-        if v not in ("primary", "high"):
-            raise ValueError("STAGE 只能是 primary 或 high")
-        return v
-    if key in ("BLOCK_WAN", "BLOCK_NAS", "KICK_SESSIONS",
-               "KICK_PROJECTOR_SMB", "CHILDRENS_DAY"):
-        v = v.strip()
-        if v not in ("0", "1"):
-            raise ValueError("%s 只能是 0 或 1" % key)
-        return v
-    if key == "FETCH_TIMEOUT":
-        v = v.strip()
-        if not re.fullmatch(r"\d+", v):
-            raise ValueError("FETCH_TIMEOUT 必须是整数秒")
-        return v
-    if key in ("PROJECTOR_IP", "NAS_IP"):
-        v = v.strip()
-        if v and not IP_RE.match(v):
-            raise ValueError("%s 不是合法 IP 地址" % key)
-        return v
-    if key == "PROJECTOR_MAC":
-        v = v.strip()
-        if v and not MAC_RE.match(v):
-            raise ValueError("MAC 格式应为 AA:BB:CC:DD:EE:FF")
-        return v
-    if key == "LAN_NET":
-        v = v.strip()
-        if v and not NET_RE.match(v):
-            raise ValueError("网段格式应为 192.168.1.0/24")
-        return v
-    if key == "WAN_IF":
-        v = v.strip()
-        if v and not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,32}", v):
-            raise ValueError("网口名不合法")
-        return v
-    if key in ("RANGE_START", "RANGE_END"):
-        v = v.strip()
-        if not DATE_RE.match(v):
-            raise ValueError("%s 必须是 YYYY-MM-DD" % key)
-        return v
-    if key == "VACATION_RANGES":
-        v = v.strip()
-        if v == "":
-            return ""
-        for seg in v.split(";"):
-            seg = seg.strip()
-            if not seg:
-                continue
-            p = seg.split("|")
-            if len(p) != 3 or not DATE_RE.match(p[0].strip()) \
-                    or not DATE_RE.match(p[1].strip()) or not p[2].strip():
-                raise ValueError("寒暑假区间格式应为 起始日|结束日|名称，"
-                                 "多段用英文分号隔开")
-            if p[0].strip() > p[1].strip():
-                raise ValueError("区间 %s 的起始日不能晚于结束日" % p[0])
-        return v
+def norm_mac(s):
+    """把 MAC 归一化成 aa:bb:cc:dd:ee:ff；非法返回空串。"""
+    t = (s or "").strip().lower().replace("-", ":").replace(".", "")
+    if re.match(r"^[0-9a-f]{12}$", t):
+        t = ":".join(t[i:i + 2] for i in range(0, 12, 2))
+    return t if MAC_RE.match(t) else ""
+
+
+# ---------------------------------------------------------------- 配置读写
+
+def split_value(rest):
+    """把 'KEY=value  # 注释' 里的 value 抠出来，去引号。"""
+    v = rest.strip()
+    if v.startswith('"'):
+        i = v.find('"', 1)
+        if i > 0:
+            return v[1:i]
+        return v[1:]
+    if v.startswith("'"):
+        i = v.find("'", 1)
+        if i > 0:
+            return v[1:i]
+        return v[1:]
+    # 无引号：取到空白或 # 之前
+    v = re.split(r"\s+#|\s+", v, 1)[0]
     return v
 
 
-def fmt_kv(key, val):
-    v = "" if val is None else str(val)
-    if key in NUM_KEYS:
-        return "%s=%s" % (key, v.strip())
-    esc = (v.replace("\\", "\\\\").replace('"', '\\"')
-            .replace("$", "\\$").replace("`", "\\`"))
-    return '%s="%s"' % (key, esc)
+def read_conf(path):
+    """读 KEY=VALUE 形式的 conf，返回 dict（忽略注释行）。"""
+    kv = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\r\n")
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    if s.startswith("export ") and "=" in s:
+                        pass
+                    else:
+                        continue
+                if s.startswith("export "):
+                    s = s[7:]
+                k, rest = s.split("=", 1)
+                kv[k.strip()] = split_value(rest)
+    except Exception:
+        pass
+    return kv
 
 
 def write_conf(path, kv):
-    """按 KEY= 逐行替换；找不到就追加到文件末尾。返回被改动的键列表。"""
-    if not os.path.isfile(path):
-        raise IOError("配置文件不存在: %s" % path)
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        raw = f.read()
-    # 从 Windows 传上来的 conf 常带 CRLF，会让 sh 脚本解析出错。
-    # 既然要重写整个文件，顺手把全文归一化成 LF。
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    """按 KEY= 逐行精确替换；保留注释与结构；改前备份 .bak；统一 UTF-8 + LF。
+
+    返回实际改动的 KEY 列表。
+    """
+    old_lines = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            try:
+                os.replace(path, path + ".bak")
+            except Exception:
+                with open(path + ".bak", "wb") as b:
+                    b.write(raw)
+            old_lines = raw.decode("utf-8", "replace").replace("\r\n", "\n").split("\n")
+        except Exception:
+            old_lines = []
+    else:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+
+    done = set()
+    out = []
+    for line in old_lines:
+        s = line.strip()
+        target = s[7:] if s.startswith("export ") else s
+        if "=" in target and not target.startswith("#"):
+            k = target.split("=", 1)[0].strip()
+            if k in kv:
+                out.append("%s=%s" % (k, fmt_kv(kv[k])))
+                done.add(k)
+                continue
+        out.append(line)
+
+    rest = [k for k in kv.keys() if k not in done]
+    if rest and out and out[-1].strip() != "":
+        out.append("")
+    for k in rest:
+        out.append("%s=%s" % (k, fmt_kv(kv[k])))
+
+    text = "\n".join(out)
+    if not text.endswith("\n"):
+        text += "\n"
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return list(kv.keys())
+
+
+def fmt_kv(v):
+    s = str(v)
+    if re.search(r"[\s#;'\"]", s) or s == "":
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def logline(msg):
+    """往工具日志追加一行；失败不抛。"""
     try:
-        with open(path + ".bak", "w", encoding="utf-8", newline="\n") as f:
-            f.write(raw)
+        d = os.path.dirname(SELF_LOG)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(SELF_LOG, "a", encoding="utf-8", newline="\n") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
         pass
 
-    lines = raw.split("\n")
-    changed = []
-    for key, val in kv.items():
-        v = validate_kv(key, val)
-        newline = fmt_kv(key, v)
-        pat = re.compile(r"^\s*" + re.escape(key) + r"\s*=")
-        hit = -1
-        for i, ln in enumerate(lines):
-            if ln.strip().startswith("#"):
-                continue
-            if pat.match(ln):
-                hit = i
-                break
-        if hit >= 0:
-            m = re.match(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$", lines[hit])
-            tailc = trailing_comment(m.group(1)) if m else ""
-            lines[hit] = newline + (("   " + tailc) if tailc else "")
-        else:
-            if lines and lines[-1].strip() == "":
-                lines.insert(len(lines) - 1, newline)
-            else:
-                lines.append(newline)
-        changed.append(key)
 
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines))
-    return changed
+# ---------------------------------------------------------------- 网络全局参数
+
+def load_net():
+    kv = read_conf(SELF_NET)
+    return {
+        "wan_if": kv.get("WAN_IF", "ovs_eth0") or "ovs_eth0",
+        "lan_net": kv.get("LAN_NET", "192.168.1.0/24"),
+        "nas_ip": kv.get("NAS_IP", ""),
+    }
 
 
-# ---------------------------------------------------------------- 脚本封装
-
-def sh_proj(args, timeout=90):
-    return run(["sh", os.path.join(PROJ_BIN, "projector_block.sh")] + list(args), timeout)
-
-
-def sh_build(init=False, timeout=300):
-    args = ["--init"] if init else []
-    return run(["sh", os.path.join(CAL_BIN, "build_calendar.sh")] + args, timeout)
-
-
-def sh_isday(q, timeout=30):
-    return run(["sh", os.path.join(CAL_BIN, "is_school_day.sh"), q], timeout)
+def save_net(kv):
+    v = {}
+    for k in ("WAN_IF", "LAN_NET", "NAS_IP"):
+        if k in kv:
+            v[k] = str(kv[k]).strip()
+    if "LAN_NET" in v and v["LAN_NET"]:
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$", v["LAN_NET"]):
+            raise ValueError("LAN_NET 应形如 192.168.1.0/24")
+    if "WAN_IF" in v and v["WAN_IF"] and not re.match(r"^[A-Za-z0-9_.:-]+$", v["WAN_IF"]):
+        raise ValueError("WAN_IF 只能含字母数字与 _ . : -")
+    return write_conf(SELF_NET, v)
 
 
-def parse_show(out):
-    """把 --show 的中文输出解析成 dict（只按第一个冒号切）"""
-    d = {}
-    for line in out.splitlines():
-        if ":" not in line:
+# ---------------------------------------------------------------- 设备存储
+
+def default_windows(which):
+    """新设备的默认时段：沿用旧版默认值，避免新设备一上来全封。"""
+    if which == "school":
+        return [{"s": "08:00", "e": "12:00", "wan": 1, "lan": 1},
+                {"s": "14:00", "e": "16:30", "wan": 1, "lan": 1}]
+    return [{"s": "18:00", "e": "21:00", "wan": 1, "lan": 1}]
+
+
+def device_template(did, name, mac, note=""):
+    return {
+        "id": did,
+        "name": name,
+        "mac": mac,
+        "note": note,
+        "enabled": 1,
+        "mode": "auto",
+        "school": default_windows("school"),
+        "holiday": default_windows("holiday"),
+    }
+
+
+def norm_windows(raw, field):
+    """校验并归一化时段数组。每项 {s,e,wan,lan}。"""
+    out = []
+    if raw is None:
+        return out
+    if not isinstance(raw, list):
+        raise ValueError("%s 必须是数组" % field)
+    if len(raw) > 12:
+        raise ValueError("%s 最多 12 段" % field)
+    for i, w in enumerate(raw):
+        if not isinstance(w, dict):
+            raise ValueError("%s 第 %d 段格式不对" % (field, i + 1))
+        s = str(w.get("s", "")).strip()
+        e = str(w.get("e", "")).strip()
+        if not valid_hm(s) or not valid_hm(e):
+            raise ValueError("%s 第 %d 段时间格式应为 HH:MM" % (field, i + 1))
+        if s == e:
+            raise ValueError("%s 第 %d 段起止时间相同" % (field, i + 1))
+        a = hhmm_to_min(s)
+        b = hhmm_to_min(e)
+        dur = (b - a) if b > a else (1440 - a + b)
+        if dur > 12 * 60:
+            raise ValueError("%s 第 %d 段超过 12 小时（是不是起止填反了）" % (field, i + 1))
+        out.append({
+            "s": s, "e": e,
+            "wan": 1 if str(w.get("wan", 1)) in ("1", "true", "True") else 0,
+            "lan": 1 if str(w.get("lan", 1)) in ("1", "true", "True") else 0,
+        })
+    return out
+
+
+def load_devices():
+    """读设备清单。文件不存在就返回空清单（不自动写盘）。"""
+    doc = {"version": 1, "devices": []}
+    if not os.path.isfile(SELF_DEVICES):
+        return doc
+    try:
+        with open(SELF_DEVICES, "r", encoding="utf-8", errors="replace") as f:
+            raw = json.load(f)
+    except Exception:
+        # 坏了就备份一份，返回空清单，别让 App 直接崩
+        try:
+            os.replace(SELF_DEVICES, SELF_DEVICES + ".broken")
+        except Exception:
+            pass
+        return doc
+    if isinstance(raw, list):
+        raw = {"version": 1, "devices": raw}
+    if not isinstance(raw, dict):
+        return doc
+    lst = raw.get("devices")
+    if not isinstance(lst, list):
+        lst = []
+    out = []
+    for d in lst:
+        if not isinstance(d, dict):
             continue
-        k, v = line.split(":", 1)
-        d[k.strip()] = v.strip()
-    return d
-
-
-def clean_win(v):
-    if not v:
-        return ""
-    v = re.sub(r"（.*?）", "", v).strip()
-    return "" if v in ("无", "无，视为封禁") else v
-
-
-def iptables_refs(binpath, chain):
-    """返回引用了 chain 的规则行"""
-    res = []
-    for tbl in ("INPUT", "FORWARD"):
-        rc, out, err = run([binpath, "-S", tbl], timeout=20)
-        if rc != 0:
+        mac = norm_mac(d.get("mac", ""))
+        if not mac:
             continue
-        for ln in out.splitlines():
-            if chain in ln:
-                res.append(ln.strip())
-    return res
+        did = str(d.get("id", "")).strip() or ("d%d" % (len(out) + 1))
+        it = {
+            "id": did,
+            "name": str(d.get("name", "")).strip() or mac,
+            "mac": mac,
+            "note": str(d.get("note", "")).strip(),
+            "enabled": 1 if str(d.get("enabled", 1)) in ("1", "true", "True") else 0,
+            "mode": str(d.get("mode", "auto")),
+        }
+        if it["mode"] not in ("auto", "open", "block"):
+            it["mode"] = "auto"
+        try:
+            it["school"] = norm_windows(d.get("school"), "上学日时段")
+            it["holiday"] = norm_windows(d.get("holiday"), "放假日时段")
+        except ValueError:
+            it["school"] = default_windows("school")
+            it["holiday"] = default_windows("holiday")
+        out.append(it)
+    doc["devices"] = out
+    return doc
 
 
-def iptables_pkts(binpath, chain):
-    rc, out, err = run([binpath, "-L", chain, "-n", "-v", "-x"], timeout=20)
-    if rc != 0:
-        return None
-    total = 0
-    for ln in out.splitlines()[2:]:
-        parts = ln.split()
-        if parts and parts[0].isdigit():
-            total += int(parts[0])
-    return total
+def save_devices(doc):
+    """原子写 devices.json（写临时文件再 rename），并留一份 .bak。"""
+    d = os.path.dirname(SELF_DEVICES)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    tmp = SELF_DEVICES + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    if os.path.isfile(SELF_DEVICES):
+        try:
+            with open(SELF_DEVICES, "rb") as f:
+                old = f.read()
+            with open(SELF_DEVICES + ".bak", "wb") as f:
+                f.write(old)
+        except Exception:
+            pass
+    os.replace(tmp, SELF_DEVICES)
 
 
-# ---------------------------------------------------------------- 业务：状态
+def next_id(doc):
+    n = 1
+    used = set()
+    for d in doc["devices"]:
+        used.add(d.get("id", ""))
+    while ("d%d" % n) in used:
+        n += 1
+    return "d%d" % n
+
+
+def find_device(doc, did):
+    for d in doc["devices"]:
+        if d.get("id") == did:
+            return d
+    return None
+
+
+# ---------------------------------------------------------------- 校历（只读）
 
 def calendar_info():
     info = {
@@ -523,72 +489,36 @@ def calendar_info():
     return info
 
 
-def get_status():
-    cal = read_conf(CAL_CONF)
-    proj = read_conf(PROJ_CONF)
+def day_type(date=None):
+    """判定某天是上学日还是放假日：school / holiday / unknown。
 
-    st = {
-        "ok": True,
-        "version": VERSION,
-        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "date": time.strftime("%Y-%m-%d"),
-    }
-
-    # ---- 校历相关字段：直接来自 calendar.conf ----
-    # （media 密码管控已整体移除，校历字段一律直接读 conf，挂到 calendar 对象里。）
-    cal_fields = {
-        "school_windows": cal.get("SCHOOL_WINDOWS", ""),
-        "holiday_windows": cal.get("HOLIDAY_WINDOWS", ""),
-        "stage": cal.get("STAGE", "primary"),
-        "vacation_ranges": cal.get("VACATION_RANGES", ""),
-        "childrens_day": cal.get("CHILDRENS_DAY", "1"),
-        "kick_sessions": cal.get("KICK_SESSIONS", "0"),
-        "fetch_timeout": cal.get("FETCH_TIMEOUT", "15"),
-        "target_user": cal.get("TARGET_USER", ""),
-        "range_start": cal.get("RANGE_START", ""),
-        "range_end": cal.get("RANGE_END", ""),
-    }
-
-    # ---- 电视端 ----
-    rc2, out2, err2 = sh_proj(["--show"])
-    if rc2 != 0 and not out2:
-        st["projector"] = {"error": (err2 or out2 or "projector_block.sh 执行失败").strip()}
-    else:
-        p = parse_show(out2)
-        ipt = find_bin("iptables")
-        ip6t = find_bin("ip6tables")
-        st["projector"] = {
-            "want": p.get("应置状态", ""),
-            "last": p.get("上次状态", ""),
-            "override": p.get("强制模式", ""),
-            "windows": clean_win(p.get("适用窗口", "")),
-            "day_type": p.get("今天类型", ""),
-            "now": p.get("当前时间", ""),
-            "ip": proj.get("PROJECTOR_IP", ""),
-            "mac": proj.get("PROJECTOR_MAC", ""),
-            "nas_ip": proj.get("NAS_IP", ""),
-            "wan_if": proj.get("WAN_IF", ""),
-            "lan_net": proj.get("LAN_NET", ""),
-            "block_wan": proj.get("BLOCK_WAN", "1"),
-            "block_nas": proj.get("BLOCK_NAS", "1"),
-            "block_mode": proj.get("BLOCK_MODE", "reject"),
-            "kick_smb": proj.get("KICK_PROJECTOR_SMB", "1"),
-            "pkts4": iptables_pkts(ipt, "PROJ_BLOCK"),
-            "pkts6": iptables_pkts(ip6t, "PROJ_BLOCK6"),
-            "refs4": iptables_refs(ipt, "PROJ_BLOCK"),
-            "refs6": iptables_refs(ip6t, "PROJ_BLOCK6"),
-        }
-
-    # ---- 校历 ----
-    st["calendar"] = calendar_info()
-    st["calendar"].update(cal_fields)
-    return st
+    直接读 TSV（快、不依赖 sh 脚本），读不到再退回 is_school_day.sh。
+    """
+    d = date or time.strftime("%Y-%m-%d")
+    if os.path.isfile(CAL_TSV):
+        try:
+            with open(CAL_TSV, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 2 and parts[0] == d:
+                        return "school" if parts[1] == "1" else "holiday"
+        except Exception:
+            pass
+    script = os.path.join(CAL_BIN, "is_school_day.sh")
+    if os.path.isfile(script):
+        rc, out, _e = run(["sh", script, d], timeout=20)
+        t = (out or "").strip().splitlines()
+        if t:
+            v = t[0].strip()
+            if v in ("school", "holiday"):
+                return v
+    return "unknown"
 
 
-def get_month(ym):
+def month_days(ym):
     if not YM_RE.match(ym or ""):
         raise ValueError("月份格式应为 YYYY-MM")
-    rc, out, err = sh_isday(ym, timeout=40)
+    rc, out, err = run(["sh", os.path.join(CAL_BIN, "is_school_day.sh"), ym], timeout=40)
     days = []
     for line in out.splitlines():
         parts = re.split(r"\s+", line.strip(), 3)
@@ -600,368 +530,452 @@ def get_month(ym):
             "cat": parts[2] if len(parts) > 2 else "",
             "label": parts[3] if len(parts) > 3 else "",
         })
-    ovr = {}
-    for it in read_overrides():
-        if it.get("enabled") and it.get("date", "").startswith(ym):
-            ovr[it["date"]] = {"flag": it.get("flag", ""), "note": it.get("note", "")}
-    for d in days:
-        d["override"] = ovr.get(d["date"], None)
-    return {"ok": True, "ym": ym, "days": days}
+    return {"ok": True, "ym": ym, "days": days, "error": "" if days else (err or "").strip()}
 
 
 def read_overrides():
     items = []
     if not os.path.isfile(CAL_OVERRIDES):
         return items
-    with open(CAL_OVERRIDES, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("#"):
-                continue
-            p = s.split("|")
-            items.append({
-                "enabled": True,
-                "date": p[0].strip() if len(p) > 0 else "",
-                "flag": p[1].strip() if len(p) > 1 else "",
-                "note": p[2].strip() if len(p) > 2 else "",
-            })
+    try:
+        with open(CAL_OVERRIDES, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                p = s.split("|")
+                if len(p) >= 2 and DATE_RE.match(p[0]):
+                    items.append({"date": p[0], "flag": p[1],
+                                  "note": p[2] if len(p) > 2 else ""})
+    except Exception:
+        pass
     return items
 
 
-def set_override(date, flag, note):
-    if not DATE_RE.match(date or ""):
-        raise ValueError("日期格式应为 YYYY-MM-DD")
-    if flag not in ("0", "1"):
-        raise ValueError("flag 只能是 0（放假）或 1（上学）")
-    note = (note or "").replace("|", "/").replace("\n", " ").strip()
+# ---------------------------------------------------------------- iptables 引擎
 
-    lines = []
-    if os.path.isfile(CAL_OVERRIDES):
-        with open(CAL_OVERRIDES, "r", encoding="utf-8", newline="") as f:
-            lines = f.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
+KERNELTZ_CACHE = {}
+
+
+def ipt(binpath, args, timeout=20):
+    return run([binpath, "-w", "5"] + list(args), timeout)
+
+
+def has_kerneltz(binpath):
+    """xt_time 是否支持 --kerneltz（按本机时区解释时段）。"""
+    if binpath in KERNELTZ_CACHE:
+        return KERNELTZ_CACHE[binpath]
+    rc, out, err = run([binpath, "-m", "time", "--help"], timeout=10)
+    txt = (out or "") + (err or "")
+    ok = "--kerneltz" in txt
+    KERNELTZ_CACHE[binpath] = ok
+    return ok
+
+
+def tz_offset_minutes():
+    """本机时区相对 UTC 的偏移（分钟，东八区 = +480）。"""
     try:
-        with open(CAL_OVERRIDES + ".bak", "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(lines))
+        off = -time.timezone
+        if time.daylight and time.localtime().tm_isdst:
+            off = -time.altzone
+        return int(off // 60)
+    except Exception:
+        return 0
+
+
+def hhmm_to_min(s):
+    return int(s[:2]) * 60 + int(s[3:])
+
+
+def min_to_hhmm(m):
+    m = m % (24 * 60)
+    return "%02d:%02d" % (m // 60, m % 60)
+
+
+def time_args(binpath, start, end):
+    """生成 -m time 的参数；不支持 --kerneltz 就把时间换算成 UTC。"""
+    if has_kerneltz(binpath):
+        return ["-m", "time", "--kerneltz",
+                "--timestart", start, "--timestop", end]
+    off = tz_offset_minutes()
+    s = min_to_hhmm(hhmm_to_min(start) - off)
+    e = min_to_hhmm(hhmm_to_min(end) - off)
+    return ["-m", "time", "--timestart", s, "--timestop", e]
+
+
+def window_segments(w):
+    """把一个时段拆成不跨零点的若干段（xt_time 不支持 stop < start）。"""
+    s = hhmm_to_min(w["s"])
+    e = hhmm_to_min(w["e"])
+    if e > s:
+        return [(min_to_hhmm(s), min_to_hhmm(e))]
+    # 跨零点：22:00-01:00 → 22:00-23:59 + 00:00-01:00
+    if e == s:
+        return []
+    return [(min_to_hhmm(s), "23:59"), ("00:00", min_to_hhmm(e))]
+
+
+def chain_in(did):
+    return CHAIN_PREFIX + "I_" + did
+
+
+def chain_fw(did):
+    return CHAIN_PREFIX + "F_" + did
+
+
+def purge(binpath):
+    """清掉本脚本创建的全部链与跳转。删设备后残留规则靠它兜底。"""
+    rc, out, _e = ipt(binpath, ["-S"])
+    if rc != 0:
+        return False
+    lines = out.splitlines()
+    # 先拆所有引用了 HNC_ 的规则（不论挂在哪个链上）
+    for ln in lines:
+        ln = ln.strip()
+        if not ln.startswith("-A ") or CHAIN_PREFIX not in ln:
+            continue
+        try:
+            parts = shlex.split(ln)
+        except Exception:
+            continue
+        table = parts[1]
+        spec = parts[2:]
+        ipt(binpath, ["-D", table] + spec)
+    # 再清链
+    for ln in lines:
+        ln = ln.strip()
+        if ln.startswith("-N ") and ln[3:].strip().startswith(CHAIN_PREFIX):
+            ch = ln[3:].strip()
+            ipt(binpath, ["-F", ch])
+            ipt(binpath, ["-X", ch])
+    return True
+
+
+def fill_chain(binpath, chain, kind, dev, dtype, net):
+    """填一条设备链。
+
+    kind = "in"  → 设备访问 NAS 本身（INPUT 链）
+    kind = "fw"  → 设备访问外网 / 其它网段（FORWARD 链）
+    """
+    mode = dev.get("mode", "auto")
+    if mode == "open":
+        ipt(binpath, ["-A", chain, "-j", "RETURN"])
+        return
+    if mode == "block":
+        ipt(binpath, ["-A", chain, "-j", "DROP"])
+        return
+
+    wins = dev.get("school") if dtype == "school" else dev.get("holiday")
+    wins = wins or []
+
+    if kind == "in":
+        # DNS 例外：设备把群晖当 DNS 时，封内网不能顺手把上网也弄断。
+        # 只对「有外网放行」的设备放 53，避免全封时还漏个口子。
+        if any(w.get("wan") for w in wins):
+            for proto in ("udp", "tcp"):
+                ipt(binpath, ["-A", chain, "-p", proto, "--dport", "53", "-j", "RETURN"])
+        for w in wins:
+            if not w.get("lan"):
+                continue
+            for seg_s, seg_e in window_segments(w):
+                ipt(binpath, ["-A", chain] + time_args(binpath, seg_s, seg_e) + ["-j", "RETURN"])
+        ipt(binpath, ["-A", chain, "-j", "DROP"])
+        return
+
+    for w in wins:
+        if not w.get("wan"):
+            continue
+        for seg_s, seg_e in window_segments(w):
+            ipt(binpath, ["-A", chain] + time_args(binpath, seg_s, seg_e) + ["-j", "RETURN"])
+    ipt(binpath, ["-A", chain, "-j", "DROP"])
+
+
+def apply_devices(reason="manual"):
+    """按设备清单全量重建防火墙规则。返回摘要 dict。"""
+    with CMD_LOCK:
+        doc = load_devices()
+        net = load_net()
+        dtype = day_type()
+        devs = doc.get("devices") or []
+
+        v4 = find_bin("iptables")
+        v6 = find_bin("ip6tables")
+
+        errors = []
+        built = 0
+
+        if not v4:
+            errors.append("找不到 iptables 命令，规则未下发")
+
+        for binpath, fam in ((v4, "v4"), (v6, "v6")):
+            if not binpath:
+                continue
+            st = ipt(binpath, ["-S"], timeout=30)
+            if st[0] != 0:
+                errors.append("%s 不可用: %s" % (fam, (st[2] or "").strip()))
+                continue
+            purge(binpath)
+
+            for d in devs:
+                if not d.get("enabled", 1):
+                    continue
+                mac = d.get("mac", "")
+                if not mac:
+                    continue
+                did = d.get("id", "")
+                ci = chain_in(did)
+                cf = chain_fw(did)
+
+                rc, _o, e = ipt(binpath, ["-N", ci])
+                if rc != 0:
+                    errors.append("%s 建链失败 %s: %s" % (fam, ci, e.strip()))
+                    continue
+                ipt(binpath, ["-N", cf])
+
+                rc, _o, e = ipt(binpath, ["-A", "INPUT", "-m", "mac",
+                                          "--mac-source", mac, "-j", ci])
+                if rc != 0:
+                    errors.append("%s 挂 INPUT 失败 %s: %s" % (fam, mac, e.strip()))
+
+                if fam == "v4" and net.get("lan_net"):
+                    # 只对「去往外网/其它网段」的流量做外网管控，内网互通不误伤
+                    rc, _o, e = ipt(binpath, ["-A", "FORWARD", "-m", "mac",
+                                              "--mac-source", mac,
+                                              "!", "-d", net["lan_net"], "-j", cf])
+                else:
+                    rc, _o, e = ipt(binpath, ["-A", "FORWARD", "-m", "mac",
+                                              "--mac-source", mac, "-j", cf])
+                if rc != 0:
+                    errors.append("%s 挂 FORWARD 失败 %s: %s" % (fam, mac, e.strip()))
+
+                fill_chain(binpath, ci, "in", d, dtype, net)
+                fill_chain(binpath, cf, "fw", d, dtype, net)
+                built += 1
+
+        msg = "apply(%s) day=%s devices=%d chains=%d" % (reason, dtype, len(devs), built)
+        logline(msg + ((" errors=" + "; ".join(errors)) if errors else ""))
+        return {
+            "ok": not errors,
+            "day_type": dtype,
+            "devices": len(devs),
+            "built": built,
+            "iptables": bool(v4),
+            "ip6tables": bool(v6),
+            "kerneltz": has_kerneltz(v4) if v4 else False,
+            "errors": errors,
+            "output": msg,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+def chain_pkts(binpath, chain):
+    rc, out, _e = ipt(binpath, ["-L", chain, "-n", "-v", "-x"], timeout=20)
+    if rc != 0:
+        return None
+    total = 0
+    for ln in out.splitlines()[2:]:
+        parts = ln.split()
+        if parts and parts[0].isdigit():
+            total += int(parts[0])
+    return total
+
+
+def ip_of_mac(mac):
+    """从 ARP 表按 MAC 反查当前 IP（只用于界面展示 / 踢连接）。"""
+    try:
+        with open("/proc/net/arp", "r", encoding="utf-8", errors="replace") as f:
+            for line in f.readlines()[1:]:
+                p = line.split()
+                if len(p) >= 4 and p[3].lower() == mac.lower():
+                    return p[0]
     except Exception:
         pass
-
-    newline = "%s|%s|%s" % (date, flag, note)
-    hit = -1
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("#"):
-            continue
-        p = ln.split("|")
-        if p and p[0].strip() == date:
-            hit = i
-            break
-    if hit >= 0:
-        lines[hit] = newline
-    else:
-        while lines and lines[-1].strip() == "":
-            lines.pop()
-        lines.append(newline)
-        lines.append("")
-
-    with open(CAL_OVERRIDES, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines))
-    return newline
+    return ""
 
 
-def del_override(date):
-    if not os.path.isfile(CAL_OVERRIDES):
+def kick_device(mac):
+    """清掉该设备已建立的连接（换模式时立刻生效）。"""
+    ip = ip_of_mac(mac)
+    if not ip:
         return False
-    with open(CAL_OVERRIDES, "r", encoding="utf-8", newline="") as f:
-        lines = f.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    out = []
-    removed = False
-    for ln in lines:
-        if not ln.strip().startswith("#"):
-            p = ln.split("|")
-            if p and p[0].strip() == date:
-                removed = True
-                continue
-        out.append(ln)
-    if removed:
-        with open(CAL_OVERRIDES, "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(out))
-    return removed
+    ct = find_bin("conntrack")
+    if not ct:
+        return False
+    rc, _o, _e = run([ct, "-D", "-s", ip], timeout=20)
+    return rc == 0
 
 
-# ---------------------------------------------------------------- 业务：动作
+# ---------------------------------------------------------------- 状态
 
-def act_apply_all():
-    return act_proj_apply()
-
-
-def act_proj_apply():
-    rc, o, e = sh_proj([])
-    return {"ok": rc == 0, "output": (o + e).strip(), "rc": rc}
-
-
-def act_proj_mode(mode):
-    if mode not in ("on", "off", "auto"):
-        raise ValueError("mode 只能是 on/off/auto")
-    rc, o, e = sh_proj(["--" + mode])
-    return {"ok": rc == 0, "output": (o + e).strip(), "rc": rc}
-
-
-def act_build(init):
-    rc, o, e = sh_build(init)
-    out = (o or "") + (("\n[stderr]\n" + e) if e.strip() else "")
-    return {"ok": rc == 0, "output": out.strip(), "rc": rc,
-            "calendar": calendar_info()}
-
-
-def do_config(body):
-    """改配置 + 可选立即生效。HTTP 与命令行模式共用这一份实现。"""
-    scope = body.get("scope", "")
-    kv = body.get("set") or {}
-    do_apply = bool(body.get("apply", True))
-
-    if scope == "calendar":
-        path = CAL_CONF
-    elif scope == "projector":
-        path = PROJ_CONF
+def now_state(dev, dtype, now_min=None):
+    """算这台设备此刻应该是放行还是封禁（内网 / 外网分别算）。"""
+    if now_min is None:
+        lt = time.localtime()
+        now_min = lt.tm_hour * 60 + lt.tm_min
+    mode = dev.get("mode", "auto")
+    if mode == "open":
+        return {"lan": True, "wan": True, "text": "长期放行"}
+    if mode == "block":
+        return {"lan": False, "wan": False, "text": "长期封禁"}
+    wins = dev.get("school") if dtype == "school" else dev.get("holiday")
+    wins = wins or []
+    lan_ok = False
+    wan_ok = False
+    for w in wins:
+        s = hhmm_to_min(w["s"])
+        e = hhmm_to_min(w["e"])
+        inside = (s <= now_min < e) if e > s else (now_min >= s or now_min < e)
+        if inside:
+            if w.get("lan"):
+                lan_ok = True
+            if w.get("wan"):
+                wan_ok = True
+    if lan_ok and wan_ok:
+        t = "时段内：内网+外网"
+    elif wan_ok:
+        t = "时段内：仅外网"
+    elif lan_ok:
+        t = "时段内：仅内网"
     else:
-        raise ValueError("scope 必须是 calendar 或 projector")
-    if not isinstance(kv, dict) or not kv:
-        raise ValueError("缺少 set 字段")
-    if not os.path.isfile(path):
-        raise IOError("配置文件不存在: " + path)
-    if not os.access(path, os.W_OK):
-        raise IOError("配置文件不可写（未以 root 运行?）: " + path)
-
-    with CMD_LOCK:
-        changed = write_conf(path, kv)
-        out = ""
-        if do_apply:
-            out = act_apply_all().get("output", "")
-    return {"ok": True, "changed": changed, "apply_output": out}
+        t = "时段外：全封"
+    return {"lan": lan_ok, "wan": wan_ok, "text": t}
 
 
-def do_action(body):
-    """执行一个动作。HTTP 与命令行模式共用这一份实现。"""
-    act = body.get("action", "")
-    with CMD_LOCK:
-        if act == "apply_all":
-            r = act_apply_all()
-        elif act == "proj_apply":
-            r = act_proj_apply()
-        elif act in ("proj_on", "proj_off", "proj_auto"):
-            r = act_proj_mode(act.replace("proj_", ""))
-        elif act == "cal_build":
-            r = act_build(False)
-        elif act == "cal_init":
-            r = act_build(True)
-        else:
-            raise ValueError("未知 action: " + act)
-    r["action"] = act
-    return r
+def get_status():
+    cal = read_conf(CAL_CONF)
+    dtype = day_type()
+    net = load_net()
+    doc = load_devices()
 
+    v4 = find_bin("iptables")
+    v6 = find_bin("ip6tables")
 
-# ---------------------------------------------------------------- HTTP
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "NASToolsAPI/" + VERSION
-    protocol_version = "HTTP/1.1"
-
-    # ---------- 底层 ----------
-    def _body(self):
-        n = 0
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-        except Exception:
-            n = 0
-        if n <= 0:
-            return {}
-        raw = self.rfile.read(n)
-        try:
-            return json.loads(raw.decode("utf-8", "replace"))
-        except Exception:
-            return {}
-
-    def _send(self, code, obj):
-        try:
-            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        except Exception:
-            body = b'{"ok":false,"error":"serialize failed"}'
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except Exception:
-            pass
-
-    def _token_ok(self):
-        tok = self.headers.get("X-Token") or ""
-        if not tok:
-            q = parse_qs(urlparse(self.path).query)
-            tok = (q.get("token") or [""])[0]
-        return tok == CFG["TOKEN"]
-
-    def log_message(self, fmt, *args):
-        try:
-            msg = "[%s] %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    self.address_string(), fmt % args)
-        except Exception:
-            msg = "[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), self.path)
-        sys.stderr.write(msg)
-        sys.stderr.flush()
-
-    # ---------- GET ----------
-    def do_GET(self):
-        u = urlparse(self.path)
-        p = u.path.rstrip("/")
-        q = parse_qs(u.query)
-
-        if p in ("/", "/api/health"):
-            ok = self._token_ok()
-            info = {"ok": True, "service": "nas_tools_api",
-                    "version": VERSION, "auth_ok": ok}
-            if ok:
-                info["cal_home"] = CAL_HOME
-                info["proj_home"] = PROJ_HOME
-                info["paths_ok"] = {
-                    "calendar_conf": os.path.isfile(CAL_CONF),
-                    "projector_conf": os.path.isfile(PROJ_CONF),
-                    "projector_block": os.path.isfile(os.path.join(PROJ_BIN, "projector_block.sh")),
-                }
-            return self._send(200, info)
-
-        if not self._token_ok():
-            return self._send(401, {"ok": False, "error": "token 不正确", "code": 401})
-
-        try:
-            if p == "/api/status":
-                return self._send(200, get_status())
-
-            if p == "/api/calendar":
-                ym = (q.get("ym") or [""])[0]
-                return self._send(200, get_month(ym))
-
-            if p == "/api/overrides":
-                return self._send(200, {"ok": True, "items": read_overrides()})
-
-            if p == "/api/logs":
-                try:
-                    n = int((q.get("n") or ["80"])[0])
-                except Exception:
-                    n = 80
-                n = max(1, min(n, 500))
-                return self._send(200, {"ok": True, "logs": {
-                    "校历构建": tail(os.path.join(CAL_LOG, "build.log"), n),
-                    "电视端": tail(os.path.join(PROJ_LOG, "projector.log"), n),
-                    "API 服务": tail(SELF_LOG, n),
-                }})
-
-            return self._send(404, {"ok": False, "error": "no such endpoint: " + p})
-        except Exception as e:
-            return self._send(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
-
-    # ---------- POST ----------
-    def do_POST(self):
-        u = urlparse(self.path)
-        p = u.path.rstrip("/")
-
-        if not self._token_ok():
-            return self._send(401, {"ok": False, "error": "token 不正确", "code": 401})
-
-        body = self._body()
-
-        # 改配置 + 可选立即生效（加锁，避免和别的命令抢）
-        if p == "/api/config":
-            try:
-                return self._send(200, do_config(body))
-            except ValueError as e:
-                return self._send(400, {"ok": False, "error": str(e)})
-            except Exception as e:
-                return self._send(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
-
-        # 各类动作
-        if p == "/api/action":
-            try:
-                return self._send(200, do_action(body))
-            except (ValueError, RuntimeError) as e:
-                return self._send(400, {"ok": False, "error": str(e)})
-            except Exception as e:
-                return self._send(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
-
-        # 单日覆盖
-        if p == "/api/overrides":
-            op = body.get("op", "")
-            date = (body.get("date") or "").strip()
-            try:
-                with CMD_LOCK:
-                    if op == "set":
-                        line = set_override(date, str(body.get("flag", "")).strip(),
-                                            body.get("note", ""))
-                        r = act_build(False)
-                        return self._send(200, {"ok": True, "line": line,
-                                                "build_output": r.get("output", ""),
-                                                "items": read_overrides()})
-                    elif op == "del":
-                        removed = del_override(date)
-                        r = act_build(False)
-                        return self._send(200, {"ok": True, "removed": removed,
-                                                "build_output": r.get("output", ""),
-                                                "items": read_overrides()})
-                    elif op == "list":
-                        return self._send(200, {"ok": True, "items": read_overrides()})
-                    else:
-                        return self._send(400, {"ok": False, "error": "op 必须是 set/del/list"})
-            except ValueError as e:
-                return self._send(400, {"ok": False, "error": str(e)})
-            except Exception as e:
-                return self._send(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
-
-        return self._send(404, {"ok": False, "error": "no such endpoint: " + p})
-
-
-# ---------------------------------------------------------------- 命令行模式
-
-# 命令行模式下 stdout 只有一行结果，且带这个前缀，
-# 因为 sudo -S 会把 "[sudo] password for xxx:" 之类的提示混进输出里，
-# App 端靠前缀把真正的 JSON 捞出来。
-OUT_MARK = "__NAS_JSON__ "
-
-
-def emit(obj):
-    sys.stdout.write(OUT_MARK + json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-
-def do_probe():
-    """环境探测：给 App 首次连接时用（找目录、看权限、看脚本版本）"""
-    cal, proj, all_cal, all_proj = detect_homes()
-    if cal or proj:
-        set_homes(cal, proj)
-    try:
-        euid = os.geteuid()
-    except Exception:
-        euid = -1
-    return {
+    st = {
         "ok": True,
         "version": VERSION,
-        "python": sys.version.split()[0],
-        "euid": euid,
-        "is_root": euid == 0,
-        "cal_home": cal,
-        "proj_home": proj,
-        "candidates_cal": all_cal,
-        "candidates_proj": all_proj,
-        "paths_ok": {
-            "calendar_conf": bool(cal) and os.path.isfile(CAL_CONF),
-            "projector_conf": bool(proj) and os.path.isfile(PROJ_CONF),
-            "projector_block": bool(proj) and os.path.isfile(
-                os.path.join(PROJ_BIN, "projector_block.sh")),
-        },
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "date": time.strftime("%Y-%m-%d"),
+        "day_type": dtype,
+        "day_label": "上学日" if dtype == "school" else (
+            "放假日" if dtype == "holiday" else "未知（按放假日处理）"),
+        "net": net,
+        "host": HOME,
     }
+
+    cal_fields = {
+        "school_windows": cal.get("SCHOOL_WINDOWS", ""),
+        "holiday_windows": cal.get("HOLIDAY_WINDOWS", ""),
+        "stage": cal.get("STAGE", "primary"),
+        "vacation_ranges": cal.get("VACATION_RANGES", ""),
+        "range_start": cal.get("RANGE_START", ""),
+        "range_end": cal.get("RANGE_END", ""),
+    }
+    st["calendar"] = calendar_info()
+    st["calendar"].update(cal_fields)
+
+    out = []
+    for d in doc["devices"]:
+        it = dict(d)
+        it["ip"] = ip_of_mac(d["mac"])
+        ns = now_state(d, dtype, None)
+        it["lan_now"] = 1 if ns["lan"] else 0
+        it["wan_now"] = 1 if ns["wan"] else 0
+        it["state_text"] = ns["text"]
+        it["pkts4"] = chain_pkts(v4, chain_in(d["id"])) if v4 else None
+        it["pkts4_wan"] = chain_pkts(v4, chain_fw(d["id"])) if v4 else None
+        it["pkts6"] = chain_pkts(v6, chain_in(d["id"])) if v6 else None
+        out.append(it)
+    st["devices"] = out
+    st["count"] = len(out)
+    return st
+
+
+# ---------------------------------------------------------------- 设备增删改
+
+def dev_add(name, mac, note=""):
+    name = (name or "").strip()
+    mac = norm_mac(mac)
+    if not name:
+        raise ValueError("设备名称不能为空")
+    if len(name) > 32:
+        raise ValueError("设备名称最多 32 个字")
+    if not mac:
+        raise ValueError("MAC 地址格式不对，应形如 D0:96:EA:0E:00:07")
+    if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+        raise ValueError("这个 MAC 是广播/全零地址，不能用")
+    doc = load_devices()
+    for d in doc["devices"]:
+        if d["mac"] == mac:
+            raise ValueError("这个 MAC 已经在列表里了（%s）" % d["name"])
+    did = next_id(doc)
+    doc["devices"].append(device_template(did, name, mac, (note or "").strip()))
+    save_devices(doc)
+    r = apply_devices("add:" + did)
+    logline("add %s %s %s" % (did, name, mac))
+    return {"ok": True, "id": did, "device": doc["devices"][-1],
+            "apply": r, "devices": doc["devices"]}
+
+
+def dev_del(did):
+    doc = load_devices()
+    d = find_device(doc, did)
+    if not d:
+        raise ValueError("没有这个设备：%s" % did)
+    doc["devices"] = [x for x in doc["devices"] if x["id"] != did]
+    save_devices(doc)
+    # 立刻重建：purge 会把已删设备的链和跳转一并清掉，不留残留规则
+    r = apply_devices("del:" + did)
+    logline("del %s %s %s" % (did, d.get("name", ""), d.get("mac", "")))
+    return {"ok": True, "id": did, "removed": d, "apply": r,
+            "devices": doc["devices"]}
+
+
+def dev_update(did, patch):
+    doc = load_devices()
+    d = find_device(doc, did)
+    if not d:
+        raise ValueError("没有这个设备：%s" % did)
+    if "name" in patch:
+        nm = str(patch.get("name", "")).strip()
+        if not nm:
+            raise ValueError("设备名称不能为空")
+        if len(nm) > 32:
+            raise ValueError("设备名称最多 32 个字")
+        d["name"] = nm
+    if "mac" in patch:
+        mac = norm_mac(patch.get("mac", ""))
+        if not mac:
+            raise ValueError("MAC 地址格式不对")
+        for x in doc["devices"]:
+            if x["id"] != did and x["mac"] == mac:
+                raise ValueError("这个 MAC 已经被另一台设备用了")
+        d["mac"] = mac
+    if "note" in patch:
+        d["note"] = str(patch.get("note", "")).strip()
+    if "enabled" in patch:
+        d["enabled"] = 1 if str(patch.get("enabled")) in ("1", "true", "True") else 0
+    if "mode" in patch:
+        m = str(patch.get("mode", "auto"))
+        if m not in ("auto", "open", "block"):
+            raise ValueError("mode 只能是 auto / open / block")
+        d["mode"] = m
+    if "school" in patch:
+        d["school"] = norm_windows(patch.get("school"), "上学日时段")
+    if "holiday" in patch:
+        d["holiday"] = norm_windows(patch.get("holiday"), "放假日时段")
+
+    save_devices(doc)
+    r = apply_devices("update:" + did)
+    if d["mode"] == "block":
+        kick_device(d["mac"])
+    return {"ok": True, "device": d, "apply": r, "devices": doc["devices"]}
+
+
+# ---------------------------------------------------------------- 命令行
+
+def emit(obj):
+    sys.stdout.write("__HNC_JSON__ " + json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
 
 
 def cli_main(argv):
@@ -969,11 +983,14 @@ def cli_main(argv):
 
     App 通过 SSH 调用，形如：
         sudo -S -p '' python3 /volume1/docker/nas_tools/nas_api.py \
-            --json '{"cmd":"status"}' --cal-home X --proj-home Y
+            --json '{"cmd":"status"}' --home X --cal-home Y
+    定时任务直接：
+        python3 /volume1/docker/nas_tools/nas_api.py --apply
     """
     payload = None
     cal_home = None
-    proj_home = None
+    home = None
+    do_apply = False
 
     i = 0
     while i < len(argv):
@@ -986,13 +1003,17 @@ def cli_main(argv):
                 return 2
             i += 2
             continue
+        if a == "--home" and i + 1 < len(argv):
+            home = argv[i + 1]
+            i += 2
+            continue
         if a == "--cal-home" and i + 1 < len(argv):
             cal_home = argv[i + 1]
             i += 2
             continue
-        if a == "--proj-home" and i + 1 < len(argv):
-            proj_home = argv[i + 1]
-            i += 2
+        if a == "--apply":
+            do_apply = True
+            i += 1
             continue
         if a in ("--version", "-V"):
             sys.stdout.write(VERSION + "\n")
@@ -1002,22 +1023,46 @@ def cli_main(argv):
             return 0
         i += 1
 
+    if do_apply:
+        if not cal_home:
+            _c, _cands = detect_cal_home()
+            if _c:
+                cal_home = _c
+        set_homes(home, cal_home)
+        r = apply_devices("cron")
+        emit(r)
+        return 0 if r.get("ok") else 1
+
     if payload is None:
         emit({"ok": False, "error": "缺少 --json 参数"})
         return 2
 
     # 目录优先用 App 指定的，其次自动探测
-    if not (cal_home and proj_home):
-        d_cal, d_proj, _a, _b = detect_homes()
-        cal_home = cal_home or d_cal
-        proj_home = proj_home or d_proj
-    set_homes(cal_home, proj_home)
+    if not cal_home:
+        _c, _cands = detect_cal_home()
+        cal_home = _c or ""
+    set_homes(home, cal_home or DEFAULT_CAL_HOME)
 
     cmd = payload.get("cmd", "")
 
     try:
         if cmd == "probe":
-            emit(do_probe())
+            cal, cands = detect_cal_home()
+            v4 = find_bin("iptables")
+            v6 = find_bin("ip6tables")
+            emit({
+                "ok": True,
+                "version": VERSION,
+                "python": sys.executable or "/bin/python3",
+                "home": HOME,
+                "cal_home": cal or CAL_HOME,
+                "candidates_cal": ";".join(cands),
+                "tool_home": HOME,
+                "iptables": v4,
+                "ip6tables": v6,
+                "kerneltz": bool(v4) and has_kerneltz(v4),
+                "day_type": day_type(),
+            })
             return 0
 
         if cmd == "status":
@@ -1025,32 +1070,55 @@ def cli_main(argv):
             return 0
 
         if cmd == "calendar":
-            emit(get_month(payload.get("ym", "")))
+            emit(month_days(payload.get("ym", "")))
             return 0
+
+        if cmd == "devices":
+            op = payload.get("op", "list")
+            if op == "list":
+                emit({"ok": True, "devices": load_devices()["devices"]})
+                return 0
+            if op == "add":
+                emit(dev_add(payload.get("name", ""), payload.get("mac", ""),
+                             payload.get("note", "")))
+                return 0
+            if op == "del":
+                emit(dev_del(str(payload.get("id", "")).strip()))
+                return 0
+            if op == "update":
+                did = str(payload.get("id", "")).strip()
+                patch = payload.get("set") or {}
+                if not isinstance(patch, dict):
+                    raise ValueError("set 必须是对象")
+                emit(dev_update(did, patch))
+                return 0
+            emit({"ok": False, "error": "op 必须是 list/add/del/update"})
+            return 2
+
+        if cmd == "apply":
+            emit(apply_devices("app"))
+            return 0
+
+        if cmd == "net":
+            op = payload.get("op", "get")
+            if op == "get":
+                emit({"ok": True, "net": load_net()})
+                return 0
+            if op == "set":
+                kv = payload.get("set") or {}
+                save_net(kv)
+                emit({"ok": True, "net": load_net(), "apply": apply_devices("net")})
+                return 0
+            emit({"ok": False, "error": "op 必须是 get/set"})
+            return 2
 
         if cmd == "overrides":
             op = payload.get("op", "list")
-            with CMD_LOCK:
-                if op == "list":
-                    emit({"ok": True, "items": read_overrides()})
-                elif op == "set":
-                    line = set_override(str(payload.get("date", "")).strip(),
-                                        str(payload.get("flag", "")).strip(),
-                                        payload.get("note", ""))
-                    r = act_build(False)
-                    emit({"ok": True, "line": line,
-                          "build_output": r.get("output", ""),
-                          "items": read_overrides()})
-                elif op == "del":
-                    removed = del_override(str(payload.get("date", "")).strip())
-                    r = act_build(False)
-                    emit({"ok": True, "removed": removed,
-                          "build_output": r.get("output", ""),
-                          "items": read_overrides()})
-                else:
-                    emit({"ok": False, "error": "op 必须是 set/del/list"})
-                    return 2
-            return 0
+            if op == "list":
+                emit({"ok": True, "items": read_overrides()})
+                return 0
+            emit({"ok": False, "error": "单日覆盖已废弃，只支持 list"})
+            return 2
 
         if cmd == "logs":
             try:
@@ -1059,17 +1127,51 @@ def cli_main(argv):
                 n = 80
             n = max(1, min(n, 500))
             emit({"ok": True, "logs": {
+                "联网控制": tail(SELF_LOG, n),
                 "校历构建": tail(os.path.join(CAL_LOG, "build.log"), n),
-                "电视端": tail(os.path.join(PROJ_LOG, "projector.log"), n),
             }})
             return 0
 
         if cmd == "config":
-            emit(do_config(payload))
+            # 只保留校历项目的配置写入（寒暑假区间 / 学段）；设备规则走 devices.update
+            scope = payload.get("scope", "")
+            kv = payload.get("set") or {}
+            if scope != "calendar":
+                raise ValueError("scope 只能是 calendar（设备规则请用 devices.update）")
+            if not isinstance(kv, dict) or not kv:
+                raise ValueError("缺少 set 字段")
+            if not os.path.isfile(CAL_CONF):
+                raise IOError("配置文件不存在: " + CAL_CONF)
+            with CMD_LOCK:
+                write_conf(CAL_CONF, kv)
+                out = ""
+                if payload.get("apply", True):
+                    rc, o, e = run(["sh", os.path.join(CAL_BIN, "build_calendar.sh")], timeout=300)
+                    out = ((o or "") + (e or "")).strip()
+                r = apply_devices("config:calendar")
+            emit({"ok": True, "changed": list(kv.keys()), "apply_output": out,
+                  "rebuild": r})
             return 0
 
         if cmd == "action":
-            emit(do_action(payload))
+            act = payload.get("action", "")
+            with CMD_LOCK:
+                if act in ("apply_all", "apply"):
+                    r = apply_devices("action")
+                elif act == "cal_build":
+                    rc, o, e = run(["sh", os.path.join(CAL_BIN, "build_calendar.sh")],
+                                   timeout=300)
+                    r = {"ok": rc == 0, "output": ((o or "") + (e or "")).strip(),
+                         "rc": rc, "calendar": calendar_info()}
+                elif act == "cal_init":
+                    rc, o, e = run(["sh", os.path.join(CAL_BIN, "build_calendar.sh"), "--init"],
+                                   timeout=300)
+                    r = {"ok": rc == 0, "output": ((o or "") + (e or "")).strip(),
+                         "rc": rc, "calendar": calendar_info()}
+                else:
+                    raise ValueError("未知 action: " + act)
+            r["action"] = act
+            emit(r)
             return 0
 
         emit({"ok": False, "error": "未知 cmd: " + cmd})
@@ -1083,60 +1185,10 @@ def cli_main(argv):
         return 1
 
 
-# ---------------------------------------------------------------- 入口
-
-def serve_main():
-    global CFG
-    CFG = load_self_conf()
-
-    for d in (os.path.join(SELF_HOME, "log"), os.path.join(SELF_HOME, "conf")):
-        try:
-            os.makedirs(d, exist_ok=True)
-        except Exception:
-            pass
-
-    logf = None
-    try:
-        logf = open(SELF_LOG, "a", encoding="utf-8", newline="\n")
-        sys.stderr = logf
-    except Exception:
-        pass
-
-    port = int(CFG.get("PORT", "8899"))
-    bind = CFG.get("BIND", "0.0.0.0")
-
-    banner = []
-    banner.append("=" * 58)
-    banner.append(" nas_tools API %s 启动" % VERSION)
-    banner.append(" 时间     : %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
-    banner.append(" 监听     : %s:%d" % (bind, port))
-    banner.append(" python   : %s" % sys.version.split()[0])
-    banner.append(" euid     : %s %s" % (
-        os.geteuid(), "" if os.geteuid() == 0 else "  <== 警告: 非 root，iptables/改密码会失败"))
-    banner.append(" 校历目录 : %s %s" % (CAL_HOME, "OK" if os.path.isdir(CAL_HOME) else "缺失"))
-    banner.append(" 投影目录 : %s %s" % (PROJ_HOME, "OK" if os.path.isdir(PROJ_HOME) else "缺失"))
-    banner.append("=" * 58)
-    sys.stderr.write("\n".join(banner) + "\n")
-    sys.stderr.flush()
-    print("\n".join(banner))
-
-    srv = ThreadingHTTPServer((bind, port), Handler)
-    srv.daemon_threads = True
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        srv.server_close()
-
-
 def main():
-    # 有 --json / --version 就走命令行模式，否则常驻 HTTP 服务
-    for a in sys.argv[1:]:
-        if a in ("--json", "--version", "-V", "--help", "-h"):
-            return cli_main(sys.argv[1:])
-    return serve_main()
+    code = cli_main(sys.argv[1:])
+    sys.exit(code)
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    main()

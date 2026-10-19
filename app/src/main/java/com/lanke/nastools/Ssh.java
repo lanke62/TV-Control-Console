@@ -35,11 +35,21 @@ import android.util.Base64;
  */
 public class Ssh {
 
-    /** 远端脚本暂存目录。用 /tmp：不留常驻文件，且所有用户可写，无需 sudo 建目录 */
-    private static final String REMOTE_DIR = "/tmp/nas_tools";
-    private static final String REMOTE_PY = REMOTE_DIR + "/nas_api.py";
+    /**
+     * 远端脚本目录。
+     *
+     * 必须是**持久**目录：DSM 的定时任务（开机 + 每 10 分钟跑 --apply）要用同一个路径，
+     * 放 /tmp 重启就没了，跨零点也切不了规则。/volume1/docker 不可写时自动退回 /tmp。
+     */
+    private static final String DIR_PERSIST = "/volume1/docker/nas_tools";
+    private static final String DIR_TMP = "/tmp/nas_tools";
+    private static String REMOTE_DIR = DIR_PERSIST;
+
+    private static String remotePy() {
+        return REMOTE_DIR + "/nas_api.py";
+    }
     /** 脚本输出里只有这一行是结果，sudo 的提示语等噪声靠它过滤掉 */
-    private static final String MARK = "__NAS_JSON__ ";
+    private static final String MARK = "__HNC_JSON__ ";
 
     private static final Object LOCK = new Object();
 
@@ -59,13 +69,13 @@ public class Ssh {
                 ensureScript(c, s);
                 String py = Prefs.python(c);
                 String cal = Prefs.calHome(c);
-                String proj = Prefs.projHome(c);
+                String tool = Prefs.toolHome(c);
 
                 StringBuilder cmd = new StringBuilder();
                 cmd.append("sudo -S -p '' ").append(py).append(" ")
-                        .append(REMOTE_PY).append(" --json ").append(q(req.toString()));
+                        .append(remotePy()).append(" --json ").append(q(req.toString()));
+                if (!tool.isEmpty()) cmd.append(" --home ").append(q(tool));
                 if (!cal.isEmpty()) cmd.append(" --cal-home ").append(q(cal));
-                if (!proj.isEmpty()) cmd.append(" --proj-home ").append(q(proj));
 
                 String pwd = SecurePrefs.getPassword(c);
                 Res res = exec(s, cmd.toString(), pwd, timeoutMs);
@@ -88,23 +98,23 @@ public class Ssh {
 
                 String py = Prefs.python(c);
                 String cal = redetect ? "" : Prefs.calHome(c);
-                String proj = redetect ? "" : Prefs.projHome(c);
+                String tool = redetect ? "" : Prefs.toolHome(c);
 
                 StringBuilder cmd = new StringBuilder();
                 cmd.append("sudo -S -p '' ").append(py).append(" ")
-                        .append(REMOTE_PY)
+                        .append(remotePy())
                         .append(" --json ").append(q("{\"cmd\":\"probe\"}"));
+                if (!tool.isEmpty()) cmd.append(" --home ").append(q(tool));
                 if (!cal.isEmpty()) cmd.append(" --cal-home ").append(q(cal));
-                if (!proj.isEmpty()) cmd.append(" --proj-home ").append(q(proj));
 
                 String pwd = SecurePrefs.getPassword(c);
                 Res res = exec(s, cmd.toString(), pwd, 60000);
                 Api.R out = parse(res, r);
                 if (out.ok && out.json != null) {
                     Prefs.setHomes(c, out.json.optString("cal_home", ""),
-                            out.json.optString("proj_home", ""));
+                            out.json.optString("home", out.json.optString("tool_home", "")));
                     Prefs.setCandidates(c, out.json.optString("candidates_cal", ""),
-                            out.json.optString("candidates_proj", ""));
+                            "");
                 }
                 return out;
             } catch (Exception e) {
@@ -253,7 +263,7 @@ public class Ssh {
         String one = "import hashlib,os,sys;p=sys.argv[1]"
                 + ";print(hashlib.md5(open(p,'rb').read()).hexdigest()"
                 + " if os.path.isfile(p) else '')";
-        Res res = exec(s, "python3 -c " + q(one) + " " + REMOTE_PY, pwd, 25000);
+        Res res = exec(s, "python3 -c " + q(one) + " " + remotePy(), pwd, 25000);
         return res.out.trim();
     }
 
@@ -270,7 +280,13 @@ public class Ssh {
         }
 
         // 确保远端目录存在（用 sudo 建，避免 /tmp 里残留的 root 目录导致普通用户写不进去）
-        exec(s, "sudo -S -p '' mkdir -p " + REMOTE_DIR, pwd, 20000);
+        Res mk = exec(s, "sudo -S -p '' sh -c 'mkdir -p " + REMOTE_DIR
+                + " && test -w " + REMOTE_DIR + "'", pwd, 20000);
+        if (mk.exit != 0 && DIR_PERSIST.equals(REMOTE_DIR)) {
+            // 持久卷不可写（没建共享文件夹 / 权限被改）→ 退回 /tmp，功能照用，但定时任务不可用
+            REMOTE_DIR = DIR_TMP;
+            exec(s, "sudo -S -p '' mkdir -p " + REMOTE_DIR, pwd, 20000);
+        }
 
         // 优先走 SFTP；群晖默认没开 sftp 子系统时 openChannel("sftp") 会抛
         // “failed to send channel request”，此时自动退回 exec 管道上传。
@@ -309,7 +325,7 @@ public class Ssh {
         ChannelSftp ch = (ChannelSftp) s.openChannel("sftp");
         try {
             ch.connect(20000);
-            ch.put(new ByteArrayInputStream(bytes), REMOTE_PY);
+            ch.put(new ByteArrayInputStream(bytes), remotePy());
         } finally {
             try {
                 ch.disconnect();
@@ -332,7 +348,7 @@ public class Ssh {
         OutputStream os = ch.getOutputStream();
         ch.setErrStream(se);
         ch.setCommand("sudo -S -p '' python3 -c \"import sys,base64;"
-                + "open(sys.argv[1],'wb').write(base64.b64decode(sys.stdin.read()))\" " + REMOTE_PY);
+                + "open(sys.argv[1],'wb').write(base64.b64decode(sys.stdin.read()))\" " + remotePy());
         ch.connect(25000);
         try {
             os.write((pwd + "\n").getBytes(StandardCharsets.UTF_8));
@@ -626,7 +642,7 @@ public class Ssh {
                 log.append("  python3 → ").append(r.one().isEmpty() ? "[NG] 不存在（方案依赖 python3）" : r.one().replace("\n", " ")).append("\n");
                 r = dexecSudo(session, "ls -d /volume1/docker /volume1/homes /volume2/docker 2>/dev/null", pwd, 15000);
                 log.append("  常见卷 → ").append(r.one().isEmpty() ? "(无)" : r.one().replace("\n", " ")).append("\n");
-                r = dexecSudo(session, "ls -d /volume1/docker/child_calendar /volume1/docker/projector_block 2>/dev/null", pwd, 15000);
+                r = dexecSudo(session, "ls -d /volume1/docker/nas_tools /volume1/docker/child_calendar 2>/dev/null", pwd, 15000);
                 log.append("  项目目录 → ").append(r.one().isEmpty() ? "(没找到)" : r.one().replace("\n", " ")).append("\n");
                 r = dexecSudo(session, "iptables -L -n 2>&1 | head -3", pwd, 15000);
                 log.append("  iptables → ").append(r.code == 0 ? "[OK] 可执行" : "[NG] " + r.one()).append("\n");

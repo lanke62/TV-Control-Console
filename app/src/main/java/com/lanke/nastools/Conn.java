@@ -28,6 +28,14 @@ public class Conn {
                     req.put("cmd", "overrides");
                     req.put("op", "list");
                     break;
+                case "/api/devices":
+                    req.put("cmd", "devices");
+                    req.put("op", "list");
+                    break;
+                case "/api/net":
+                    req.put("cmd", "net");
+                    req.put("op", "get");
+                    break;
                 case "/api/logs":
                     req.put("cmd", "logs");
                     req.put("n", q == null ? 80 : Integer.parseInt(nz2(q.get("n"), "80")));
@@ -58,6 +66,31 @@ public class Conn {
                 case "/api/action":
                     req.put("cmd", "action");
                     req.put("action", body == null ? "" : body.optString("action", ""));
+                    break;
+                case "/api/devices":
+                    req.put("cmd", "devices");
+                    if (body != null) {
+                        req.put("op", body.optString("op", "list"));
+                        req.put("id", body.optString("id", ""));
+                        req.put("name", body.optString("name", ""));
+                        req.put("mac", body.optString("mac", ""));
+                        req.put("note", body.optString("note", ""));
+                        req.put("set", body.optJSONObject("set"));
+                    } else {
+                        req.put("op", "list");
+                    }
+                    break;
+                case "/api/net":
+                    req.put("cmd", "net");
+                    if (body != null) {
+                        req.put("op", body.optString("op", "set"));
+                        req.put("set", body.optJSONObject("set"));
+                    } else {
+                        req.put("op", "get");
+                    }
+                    break;
+                case "/api/apply":
+                    req.put("cmd", "apply");
                     break;
                 case "/api/overrides":
                     req.put("cmd", "overrides");

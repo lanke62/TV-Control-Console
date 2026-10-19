@@ -24,7 +24,7 @@
         </activity>
 
         <activity
-            android:name=".TvParamsActivity"
+            android:name=".NetParamsActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
     </application>
